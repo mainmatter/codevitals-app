@@ -26,7 +26,7 @@ use octocrab::{
 };
 use tracing::{Instrument, info_span, warn};
 
-use crate::{App, OctocrabExt, Result, app, limits};
+use crate::{App, Result, app, limits, list};
 
 // 1. Triggers
 
@@ -84,10 +84,8 @@ pub async fn resync(app: Arc<App>) {
 }
 
 async fn schedule_all(app: &Arc<App>) -> Result {
-    let installations: Vec<Installation> = app
-        .github
-        .list("/app/installations", limits::INSTALLATIONS)
-        .await?;
+    let installations: Vec<Installation> =
+        list(&app.github, "/app/installations", limits::INSTALLATIONS).await?;
     for installation in installations {
         // One at a time, so that a suspended installation does not hold up the others.
         if let Err(error) = schedule_installation(app, installation.id).await {
@@ -99,9 +97,8 @@ async fn schedule_all(app: &Arc<App>) -> Result {
 
 async fn schedule_installation(app: &Arc<App>, installation: InstallationId) -> Result {
     let github = app.github.installation(installation)?;
-    let repositories: Vec<Repository> = github
-        .list("/installation/repositories", limits::REPOSITORIES)
-        .await?;
+    let repositories: Vec<Repository> =
+        list(&github, "/installation/repositories", limits::REPOSITORIES).await?;
     for repository in repositories {
         schedule(app, repository.id)?;
     }

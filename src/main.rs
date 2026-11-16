@@ -58,28 +58,6 @@ use tracing_subscriber::EnvFilter;
 
 pub type Result<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
-trait OctocrabExt {
-    /// Every item of the list at `path`. Fails past `limit` items.
-    async fn list<T: DeserializeOwned>(&self, path: &str, limit: usize) -> Result<Vec<T>>;
-}
-
-impl OctocrabExt for Octocrab {
-    async fn list<T: DeserializeOwned>(&self, path: &str, limit: usize) -> Result<Vec<T>> {
-        // GitHub's maximum.
-        const PER_PAGE: usize = 100;
-        let mut page: Page<T> = self.get(path, Some(&[("per_page", PER_PAGE)])).await?;
-        let mut items = Vec::new();
-        for _ in 0..limit.div_ceil(PER_PAGE) {
-            items.append(&mut page.items);
-            match self.get_page(&page.next).await? {
-                Some(next) => page = next,
-                None => return Ok(items),
-            }
-        }
-        Err(format!("more than {limit} items at {path}").into())
-    }
-}
-
 #[derive(Parser)]
 #[command(version)]
 struct Config {
@@ -108,11 +86,6 @@ struct Config {
     /// File holding the app's webhook secret.
     #[arg(long = "webhook-secret-file", value_name = "FILE", value_parser = read_secret)]
     webhook_secret: SecretString,
-}
-
-/// Reads a secret from a file, without the trailing newline most editors and `echo` leave.
-fn read_secret(path: &str) -> std::io::Result<SecretString> {
-    Ok(std::fs::read_to_string(path)?.trim_end().into())
 }
 
 struct App {
@@ -211,6 +184,29 @@ async fn shutdown() {
         _ = terminate.recv() => {}
     }
     info!("shutting down");
+}
+
+// Plumbing
+
+/// Reads a secret from a file, without the trailing newline most editors and `echo` leave.
+fn read_secret(path: &str) -> std::io::Result<SecretString> {
+    Ok(std::fs::read_to_string(path)?.trim_end().into())
+}
+
+/// Every item of GitHub's list at `path`. Fails past `limit` items.
+async fn list<T: DeserializeOwned>(github: &Octocrab, path: &str, limit: usize) -> Result<Vec<T>> {
+    // GitHub's maximum.
+    const PER_PAGE: usize = 100;
+    let mut page: Page<T> = github.get(path, Some(&[("per_page", PER_PAGE)])).await?;
+    let mut items = Vec::new();
+    for _ in 0..limit.div_ceil(PER_PAGE) {
+        items.append(&mut page.items);
+        match github.get_page(&page.next).await? {
+            Some(next) => page = next,
+            None => return Ok(items),
+        }
+    }
+    Err(format!("more than {limit} items at {path}").into())
 }
 
 #[cfg(test)]

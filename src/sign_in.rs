@@ -16,7 +16,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-use crate::{App, OctocrabExt, limits};
+use crate::{App, limits, list};
 
 /// `__Host-`: set by this origin only, over HTTPS only.
 const VERIFIER_COOKIE: &str = "__Host-pkce";
@@ -95,10 +95,10 @@ pub async fn callback(
         .github
         .user_access_token(token.access_token)
         .map_err(failed)?;
-    let installations: Vec<Installation> = user
-        .list("/user/installations", limits::INSTALLATIONS)
-        .await
-        .map_err(failed)?;
+    let installations: Vec<Installation> =
+        list(&user, "/user/installations", limits::INSTALLATIONS)
+            .await
+            .map_err(failed)?;
 
     let accounts: Vec<_> = installations.into_iter().map(|i| i.account.login).collect();
     info!(?accounts, "signed in");

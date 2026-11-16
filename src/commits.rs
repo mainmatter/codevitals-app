@@ -8,8 +8,6 @@
 //! the key in lower case as role. Names and emails are as git wrote them; text that is not UTF-8
 //! is rejected.
 
-use std::collections::HashSet;
-
 use gix::{
     ObjectId,
     bstr::{BStr, ByteSlice},
@@ -34,28 +32,11 @@ pub async fn record(db: &PgPool, checkout: &Checkout, tips: Vec<ObjectId>) -> Re
 
 // 1. Reachable
 
-/// Breadth-first: `commits` is both the queue and the result, capped as each is found.
 fn reachable(repo: &gix::Repository, tips: Vec<ObjectId>) -> Result<Vec<ObjectId>> {
-    let mut seen = HashSet::new();
-    let mut found = |sha, commits: &mut Vec<_>| -> Result {
-        if seen.insert(sha) {
-            if seen.len() > limits::COMMITS {
-                return Err(format!("more than {} reachable commits", limits::COMMITS).into());
-            }
-            commits.push(sha);
-        }
-        Ok(())
-    };
-    let mut commits = Vec::new();
-    for tip in tips {
-        found(tip, &mut commits)?;
-    }
-    let mut next = 0;
-    while let Some(&sha) = commits.get(next) {
-        next += 1;
-        for parent in repo.find_commit(sha)?.parent_ids() {
-            found(parent.detach(), &mut commits)?;
-        }
+    let walk = repo.rev_walk(tips).all()?.take(limits::COMMITS + 1);
+    let commits = walk.map(|info| Ok(info?.id)).collect::<Result<Vec<_>>>()?;
+    if commits.len() > limits::COMMITS {
+        return Err(format!("more than {} reachable commits", limits::COMMITS).into());
     }
     Ok(commits)
 }
@@ -79,7 +60,7 @@ async fn missing(db: &PgPool, commits: &[ObjectId]) -> Result<Vec<ObjectId>> {
 // 3. Insert
 
 /// One statement, so a commit and its people go in together. Rows are determined by the sha, so
-/// any another sync inserted meanwhile are the same rows. People are bounded by the message, and
+/// any that another sync inserts meanwhile are the same rows. People are bounded by the message, and
 /// that by `OBJECT_BYTES`.
 async fn insert(db: &PgPool, repo: &gix::Repository, sha: ObjectId) -> Result {
     let object = repo.find_commit(sha)?;
@@ -90,18 +71,23 @@ async fn insert(db: &PgPool, repo: &gix::Repository, sha: ObjectId) -> Result {
         .parents()
         .map(|sha| sha.as_slice().to_vec())
         .collect();
-    let message = commit.message();
 
+    // Roles, names and emails, as columns, in message order.
     let mut people: [Vec<String>; 3] = Default::default();
     let mut add = |person: [&BStr; 3]| -> Result {
         for (column, field) in people.iter_mut().zip(person) {
-            column.push(utf8(field)?.to_owned());
+            column.push(field.to_str()?.to_owned());
         }
         Ok(())
     };
     add(["author".into(), author.name, author.email])?;
     add(["committer".into(), committer.name, committer.email])?;
-    for trailer in message.body().iter().flat_map(|body| body.trailers()) {
+    for trailer in commit
+        .message()
+        .body()
+        .iter()
+        .flat_map(|body| body.trailers())
+    {
         let role = trailer.token.to_ascii_lowercase();
         if let Some((name, email)) = identity(&trailer.value)
             && role.ends_with(b"-by")
@@ -128,7 +114,7 @@ async fn insert(db: &PgPool, repo: &gix::Repository, sha: ObjectId) -> Result {
     .bind(authored.offset / 60)
     .bind(committed.seconds)
     .bind(committed.offset / 60)
-    .bind(utf8(&message.summary())?)
+    .bind(commit.message().summary().to_str()?)
     .bind(roles)
     .bind(names)
     .bind(emails)
@@ -144,10 +130,6 @@ fn identity(value: &BStr) -> Option<(&BStr, &BStr)> {
     let name = name.strip_suffix(b" ").unwrap_or(name);
     let valid = |part: &[u8]| !part.is_empty() && !part.contains(&b'<') && !part.contains(&b'>');
     (valid(name) && valid(email)).then(|| (name.as_bstr(), email.as_bstr()))
-}
-
-fn utf8(bytes: &BStr) -> Result<&str> {
-    Ok(bytes.to_str()?)
 }
 
 #[cfg(test)]
