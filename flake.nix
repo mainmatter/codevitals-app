@@ -1,0 +1,99 @@
+{
+  description = "cv";
+
+  inputs = {
+    # 26.05 is the last nixpkgs release that supports x86_64-darwin (until the end of 2026).
+    nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-26.05";
+
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    crane.url = "github:ipetkov/crane";
+  };
+
+  outputs =
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+      crane,
+    }:
+    let
+      inherit (nixpkgs) lib;
+      defaultSystems = [
+        "aarch64-darwin"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "x86_64-linux"
+      ];
+      forAllSystems =
+        fn:
+        lib.genAttrs defaultSystems (
+          system:
+          let
+            pkgs = import nixpkgs {
+              inherit system;
+              overlays = [ (import rust-overlay) ];
+              config.allowDeprecatedx86_64Darwin = true;
+            };
+            rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+            craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
+          in
+          fn { inherit pkgs rustToolchain craneLib; }
+        );
+    in
+    {
+      packages = forAllSystems (
+        { craneLib, ... }:
+        {
+          default = craneLib.buildPackage {
+            src = craneLib.cleanCargoSource ./.;
+            strictDeps = true;
+            meta.mainProgram = "cv";
+          };
+        }
+      );
+
+      devShells = forAllSystems (
+        { pkgs, rustToolchain, ... }:
+        let
+          inherit (rustToolchain.availableComponents) rust-analyzer rust-src;
+        in
+        rec {
+          # What builds need, and nothing more.
+          ci = pkgs.mkShell {
+            name = "cv-ci";
+            packages = [ rustToolchain ];
+          };
+
+          # Adds editor support, from the same Rust release.
+          default = pkgs.mkShell {
+            name = "cv-dev";
+            inputsFrom = [ ci ];
+            packages = [ rust-analyzer ];
+            RUST_SRC_PATH = "${rust-src}/lib/rustlib/src/rust/library";
+          };
+        }
+      );
+
+      nixosModules.default = import ./nix/module.nix self;
+
+      checks = forAllSystems (
+        { pkgs, ... }:
+        let
+          cv = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          flags = "grep -o -- '--[a-z-]*' | grep -vx -- '--help\\|--version' | sort -u";
+        in
+        {
+          # Builds `cv`, running its tests, then fails unless `nix/module.nix` passes exactly the
+          # flags `cv` takes.
+          module-in-sync = pkgs.runCommand "module-in-sync" { } ''
+            diff -u <(${lib.getExe cv} --help | ${flags}) <(${flags} < ${./nix/module.nix})
+            touch $out
+          '';
+        }
+      );
+    };
+}
