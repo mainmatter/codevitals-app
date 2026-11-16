@@ -39,9 +39,11 @@ use tokio::time::timeout;
 
 use crate::{Result, limits};
 
+/// Into a namespace nothing reads, so that [`set_refs`] alone writes the checkout's refs. It
+/// deletes these, as every ref not wanted.
 const REFSPECS: [&str; 2] = [
-    "+refs/heads/*:refs/heads/*",
-    "+refs/pull/*/head:refs/pull/*/head",
+    "+refs/heads/*:refs/fetch/heads/*",
+    "+refs/pull/*/head:refs/fetch/pull/*/head",
 ];
 const PULLS: &str = "refs/pull/";
 const PULL_HEADS: &str = "refs/pull-heads/";
@@ -72,8 +74,6 @@ impl Checkout {
             let (checkout, interrupt) = (self.clone(), interrupt.clone());
             move || {
                 let repo = checkout.open_or_init()?;
-                // Keeps the pull request heads the fetch is about to overwrite.
-                set_refs(&repo, refs(&repo)?)?;
                 let github = fetch(&repo, &url, token, &interrupt)?;
                 set_refs(&repo, github.clone())?;
                 Ok(github)
@@ -91,8 +91,18 @@ impl Checkout {
         Ok(tokio::task::spawn_blocking(move || remove_dir(&path)).await??)
     }
 
+    /// Runs `f` on the repository, off the async runtime. `f` reaches the database with
+    /// [`crate::wait`].
+    pub async fn read<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&gix::Repository) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let checkout = self.clone();
+        tokio::task::spawn_blocking(move || f(&checkout.open()?)).await?
+    }
+
     /// Nothing from the host's git config or environment applies.
-    pub fn open(&self) -> Result<gix::Repository> {
+    fn open(&self) -> Result<gix::Repository> {
         let alloc_limit = format!("gitoxide.objects.allocLimit={}", limits::OBJECT_BYTES);
         let options = gix::open::Options::isolated().config_overrides([alloc_limit]);
         Ok(gix::open_opts(&self.0, options)?)
@@ -228,77 +238,54 @@ fn remove_dir(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 pub mod tests {
-    use std::{
-        collections::BTreeMap,
-        future::IntoFuture,
-        io::Write,
-        process::{Command, Stdio},
-    };
-
-    use axum::{
-        Router,
-        body::Bytes,
-        extract::State,
-        http::{HeaderMap, StatusCode, Uri, header},
-        response::{IntoResponse, Response},
-    };
-    use base64::{Engine, prelude::BASE64_STANDARD};
-    use tokio::net::TcpListener;
+    use std::process::Command;
 
     use super::*;
-
-    const TOKEN: &str = "secret-token";
-    const REPOSITORY: RepositoryId = RepositoryId(1);
 
     /// GitHub holds `main`, `gone` and pull request 1. Then pull request 1 is force-pushed and
     /// `gone` deleted.
     #[tokio::test]
     async fn a_replaced_pull_request_head_stays_readable() {
         let root = scratch("checkout");
-        let (github, work) = (root.join("o/r.git"), root.join("work"));
-        fs::create_dir_all(&github).unwrap();
-        fs::create_dir(&work).unwrap();
-        git(&github, &["init", "--bare"]);
-        git(&work, &["init"]);
-        git(&work, &["commit", "--allow-empty", "-m", "a"]);
-        let a = git(&work, &["rev-parse", "HEAD"]);
-        let push = |refspec| git(&work, &["push", "--force", "../o/r.git", refspec]);
+        let (github, work) = (root.join("github.git"), root.join("work"));
+        git(&root, &["init", "--bare", "github.git"]);
+        git(&root, &["init", "work"]);
+        let commit = |message| {
+            git(
+                &work,
+                &["commit", "--amend", "--allow-empty", "-m", message],
+            );
+            git(&work, &["rev-parse", "HEAD"])
+        };
+        let push = |refspec| git(&work, &["push", "--force", "../github.git", refspec]);
+        git(&work, &["commit", "--allow-empty", "-m", "root"]);
+        let a = commit("a");
         push("HEAD:refs/heads/main");
         push("HEAD:refs/heads/gone");
         push("HEAD:refs/pull/1/head");
 
-        let url = format!("{}/o/r.git", serve(root.clone()).await);
-        let checkout = Checkout::new(&root, REPOSITORY);
-        checkout.update(url.clone(), TOKEN.into()).await.unwrap();
-
-        git(&work, &["commit", "--amend", "--allow-empty", "-m", "b"]);
-        let b = git(&work, &["rev-parse", "HEAD"]);
+        let checkout = Checkout::new(&root, RepositoryId(1));
+        let url = github.to_str().unwrap().to_owned();
+        checkout.update(url.clone(), "".into()).await.unwrap();
+        let b = commit("b");
         push("HEAD:refs/pull/1/head");
         push(":refs/heads/gone");
-        checkout.update(url.clone(), TOKEN.into()).await.unwrap();
+        checkout.update(url.clone(), "".into()).await.unwrap();
 
-        let refs: BTreeMap<_, _> = git(
+        let refs = git(
             &checkout.0,
             &["for-each-ref", "--format=%(refname) %(objectname)"],
-        )
-        .lines()
-        .map(|line| line.split_once(' ').unwrap())
-        .map(|(name, oid)| (name.to_owned(), oid.to_owned()))
-        .collect();
-        let expected = BTreeMap::from([
-            ("refs/heads/main".to_owned(), a.clone()),
-            ("refs/pull/1/head".to_owned(), b.clone()),
-            (format!("refs/pull-heads/{a}"), a.clone()),
-            (format!("refs/pull-heads/{b}"), b.clone()),
-        ]);
-        assert_eq!(refs, expected);
-        assert_eq!(git(&checkout.0, &["cat-file", "-t", &a]), "commit");
-
-        let config = fs::read_to_string(checkout.0.join("config")).unwrap();
-        assert!(
-            !config.contains(TOKEN) && !config.contains(&url),
-            "{config}"
         );
+        let mut expected = vec![
+            format!("refs/heads/main {a}"),
+            format!("refs/pull-heads/{a} {a}"),
+            format!("refs/pull-heads/{b} {b}"),
+            format!("refs/pull/1/head {b}"),
+        ];
+        expected.sort();
+        assert_eq!(Vec::from_iter(refs.lines()), expected);
+        let config = fs::read_to_string(checkout.0.join("config")).unwrap();
+        assert!(!config.contains(&url), "{config}");
         remove_dir(&root).unwrap();
     }
 
@@ -327,59 +314,5 @@ pub mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    }
-
-    /// Git's smart HTTP protocol, version 2, over the repositories in `root`, for [`TOKEN`] only.
-    async fn serve(root: PathBuf) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let router = Router::new().fallback(upload_pack).with_state(root);
-        tokio::spawn(axum::serve(listener, router).into_future());
-        format!("http://{address}")
-    }
-
-    async fn upload_pack(
-        State(root): State<PathBuf>,
-        uri: Uri,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> Response {
-        let basic = format!(
-            "Basic {}",
-            BASE64_STANDARD.encode(format!("x-access-token:{TOKEN}"))
-        );
-        if headers
-            .get(header::AUTHORIZATION)
-            .is_none_or(|value| value != basic.as_str())
-        {
-            return (
-                StatusCode::UNAUTHORIZED,
-                [(header::WWW_AUTHENTICATE, "Basic")],
-            )
-                .into_response();
-        }
-        let path = uri.path();
-        let (repository, advertise) = match path.strip_suffix("/info/refs") {
-            Some(repository) => (repository, true),
-            None => (path.strip_suffix("/git-upload-pack").unwrap(), false),
-        };
-        let mut git = Command::new("git");
-        git.args(["upload-pack", "--stateless-rpc"]);
-        if advertise {
-            git.arg("--http-backend-info-refs");
-        }
-        let protocol = headers.get("git-protocol").unwrap().to_str().unwrap();
-        let mut child = (git.arg(root.join(&repository[1..])))
-            .env("GIT_PROTOCOL", protocol)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(&body).unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert!(output.status.success());
-        let kind = if advertise { "advertisement" } else { "result" };
-        let content_type = format!("application/x-git-upload-pack-{kind}");
-        ([(header::CONTENT_TYPE, content_type)], output.stdout).into_response()
     }
 }

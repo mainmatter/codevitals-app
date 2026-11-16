@@ -164,7 +164,6 @@ mod tests {
         body::{Body, to_bytes},
         http::StatusCode,
     };
-    use octocrab::AuthState;
     use serde_json::Value;
 
     use super::*;
@@ -225,7 +224,7 @@ mod tests {
         ]);
         let queries = Arc::new(AtomicUsize::new(0));
         let counted = queries.clone();
-        let github = sync::tests::github(AuthState::None, move |request| {
+        let github = sync::tests::github(move |request| {
             counted.fetch_add(1, Ordering::SeqCst);
             let github_commits = github_commits.clone();
             async move {
@@ -245,7 +244,9 @@ mod tests {
         });
 
         for _ in 0..2 {
-            let commits = commits::record(&db, &checkout, vec![tip]).await.unwrap();
+            let pool = db.clone();
+            let read = checkout.read(move |repo| commits::record(&pool, repo, vec![tip]));
+            let commits = read.await.unwrap();
             record(&github, &db, "o/r", &commits).await.unwrap();
         }
         // Four emails, one query; none left to ask the second time.

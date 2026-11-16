@@ -184,8 +184,7 @@ pub mod tests {
 
     use axum::http::{Request, Response, Uri};
     use octocrab::{
-        AuthState, EncodingKey, OctoBody, OctocrabBuilder, auth::AppAuth,
-        service::middleware::base_uri::BaseUriLayer,
+        AuthState, OctoBody, OctocrabBuilder, service::middleware::base_uri::BaseUriLayer,
     };
     use serde_json::{Value, json};
     use tokio::sync::Semaphore;
@@ -193,84 +192,47 @@ pub mod tests {
 
     use super::*;
 
-    const REPOSITORY: RepositoryId = RepositoryId(42);
-
+    /// GitHub counts each request and holds it until released, then fails it: each sync ends at
+    /// its first request.
     #[tokio::test]
     async fn pushes_during_a_sync_cause_one_more() {
-        let (app, fake) = app();
+        let (requests, release) = (Arc::new(AtomicUsize::new(0)), Arc::new(Semaphore::new(0)));
+        let (counted, held) = (requests.clone(), release.clone());
+        let app = app(github(move |_| {
+            let (counted, held) = (counted.clone(), held.clone());
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                held.acquire().await.unwrap().forget();
+                (StatusCode::BAD_REQUEST, json!({ "message": "held" }))
+            }
+        }));
         for _ in 0..10 {
-            schedule(&app, REPOSITORY).unwrap();
+            schedule(&app, RepositoryId(42)).unwrap();
             settle().await;
         }
-        fake.release.add_permits(10);
+        release.add_permits(10);
         settle().await;
-        assert_eq!(fake.reads.load(Ordering::SeqCst), 2);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
-    /// GitHub where installation 7 sees only [`REPOSITORY`]. Each read of it is counted, then
-    /// held until `release`.
-    pub struct Fake {
-        reads: AtomicUsize,
-        release: Semaphore,
-    }
-
-    pub fn app() -> (Arc<App>, Arc<Fake>) {
-        let fake = Arc::new(Fake {
-            reads: AtomicUsize::new(0),
-            release: Semaphore::new(0),
-        });
-        let faked = fake.clone();
-        let key = EncodingKey::from_rsa_pem(include_bytes!("testdata/fake-app-key.pem")).unwrap();
-        let auth = AuthState::App(AppAuth {
-            app_id: 1.into(),
-            key,
-        });
-        let github = github(auth, move |request| {
-            let (fake, path) = (faked.clone(), request.uri().path().to_owned());
-            async move {
-                if path == "/repositories/42/installation" {
-                    (StatusCode::OK, installation())
-                } else if path == "/app/installations/7/access_tokens" {
-                    let token = json!({
-                        "token": "t",
-                        "expires_at": "2099-01-01T00:00:00Z",
-                        "permissions": {},
-                    });
-                    (StatusCode::CREATED, token)
-                } else if path == "/repositories/42" {
-                    fake.reads.fetch_add(1, Ordering::SeqCst);
-                    fake.release.acquire().await.unwrap().forget();
-                    let repository = json!({
-                        "id": 42,
-                        "name": "r",
-                        "full_name": "o/r",
-                        "default_branch": "main",
-                        "size": 1,
-                        "url": "https://api.github.com/repos/o/r",
-                    });
-                    (StatusCode::OK, repository)
-                } else {
-                    (StatusCode::NOT_FOUND, json!({ "message": "Not Found" }))
-                }
-            }
-        });
+    /// Acting as `github`, with a database it never reaches.
+    pub fn app(github: Octocrab) -> Arc<App> {
         let config = crate::Config {
             listen: ([127, 0, 0, 1], 0).into(),
             database: "postgres://unused".parse().unwrap(),
             checkouts: "/unused".into(),
+            tracked_branches: Vec::new(),
             app_id: 1,
             client_id: "unused".into(),
             private_key: "unused".into(),
             client_secret: "unused".into(),
             webhook_secret: "secret".into(),
         };
-        let app = App::new(config, github.clone(), github);
-        (app, fake)
+        App::new(config, github.clone(), github)
     }
 
     /// GitHub at `http://github.test`, answering every request with `answer`.
     pub fn github<A>(
-        auth: AuthState,
         answer: impl Fn(Request<OctoBody>) -> A + Clone + Send + Sync + 'static,
     ) -> Octocrab
     where
@@ -287,25 +249,9 @@ pub mod tests {
         OctocrabBuilder::new_empty()
             .with_service(service)
             .with_layer(&BaseUriLayer::new(Uri::from_static("http://github.test")))
-            .with_auth(auth)
+            .with_auth(AuthState::None)
             .build()
             .unwrap()
-    }
-
-    fn installation() -> Value {
-        let url = "https://github.test";
-        json!({
-            "id": 7,
-            "account": {
-                "login": "o", "id": 1, "node_id": "n", "gravatar_id": "", "type": "User",
-                "site_admin": false, "avatar_url": url, "url": url, "html_url": url,
-                "followers_url": url, "following_url": url, "gists_url": url, "starred_url": url,
-                "subscriptions_url": url, "organizations_url": url, "repos_url": url,
-                "events_url": url, "received_events_url": url,
-            },
-            "permissions": {},
-            "events": [],
-        })
     }
 
     /// Runs every other task until it waits. Tests run on one thread.

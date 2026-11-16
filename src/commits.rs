@@ -13,25 +13,15 @@ use gix::{
     bstr::{BStr, ByteSlice},
 };
 use sqlx::PgPool;
-use tokio::runtime::Handle;
 
-use crate::{Result, checkout::Checkout, limits};
+use crate::{Result, limits, wait};
 
-pub async fn record(
-    db: &PgPool,
-    checkout: &Checkout,
-    tips: Vec<ObjectId>,
-) -> Result<Vec<ObjectId>> {
-    let (db, checkout, runtime) = (db.clone(), checkout.clone(), Handle::current());
-    tokio::task::spawn_blocking(move || {
-        let repo = checkout.open()?;
-        let reachable = reachable(&repo, tips)?;
-        for sha in runtime.block_on(missing(&db, &reachable))? {
-            runtime.block_on(insert(&db, &repo, sha))?;
-        }
-        Ok(reachable)
-    })
-    .await?
+pub fn record(db: &PgPool, repo: &gix::Repository, tips: Vec<ObjectId>) -> Result<Vec<ObjectId>> {
+    let reachable = reachable(repo, tips)?;
+    for i in wait(missing(db, &reachable))? {
+        insert(db, repo, reachable[i])?;
+    }
+    Ok(reachable)
 }
 
 // 1. Reachable
@@ -47,18 +37,17 @@ fn reachable(repo: &gix::Repository, tips: Vec<ObjectId>) -> Result<Vec<ObjectId
 
 // 2. Missing
 
-async fn missing(db: &PgPool, commits: &[ObjectId]) -> Result<Vec<ObjectId>> {
+/// Indices into `commits`.
+async fn missing(db: &PgPool, commits: &[ObjectId]) -> Result<Vec<usize>> {
     let shas: Vec<&[u8]> = commits.iter().map(|sha| sha.as_slice()).collect();
-    let missing: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT s FROM unnest($1::bytea[]) s WHERE NOT EXISTS (SELECT FROM commit WHERE sha = s)",
+    let missing: Vec<i64> = sqlx::query_scalar(
+        "SELECT i - 1 FROM unnest($1::bytea[]) WITH ORDINALITY AS c (sha, i)
+         WHERE NOT EXISTS (SELECT FROM commit WHERE commit.sha = c.sha)",
     )
     .bind(&shas)
     .fetch_all(db)
     .await?;
-    Ok(missing
-        .iter()
-        .map(|sha| ObjectId::from_bytes_or_panic(sha))
-        .collect())
+    Ok(missing.into_iter().map(|i| i as usize).collect())
 }
 
 // 3. Insert
@@ -66,7 +55,7 @@ async fn missing(db: &PgPool, commits: &[ObjectId]) -> Result<Vec<ObjectId>> {
 /// One statement, so a commit and its people go in together. Rows are determined by the sha, so
 /// any that another sync inserts meanwhile are the same rows. People are bounded by the message, and
 /// that by `OBJECT_BYTES`.
-async fn insert(db: &PgPool, repo: &gix::Repository, sha: ObjectId) -> Result {
+fn insert(db: &PgPool, repo: &gix::Repository, sha: ObjectId) -> Result {
     let object = repo.find_commit(sha)?;
     let commit = object.decode()?;
     let (author, committer) = (commit.author()?, commit.committer()?);
@@ -101,7 +90,7 @@ async fn insert(db: &PgPool, repo: &gix::Repository, sha: ObjectId) -> Result {
     }
     let [roles, names, emails] = people;
 
-    sqlx::query(
+    let query = sqlx::query(
         "WITH commit AS (
              INSERT INTO commit (sha, parents, author_time, author_tz, commit_time, commit_tz, subject)
              VALUES ($1, $2::sha[], to_timestamp($3::int8), $4, to_timestamp($5::int8), $6, $7)
@@ -121,9 +110,8 @@ async fn insert(db: &PgPool, repo: &gix::Repository, sha: ObjectId) -> Result {
     .bind(commit.message().summary().to_str()?)
     .bind(roles)
     .bind(names)
-    .bind(emails)
-    .execute(db)
-    .await?;
+    .bind(emails);
+    wait(query.execute(db))?;
     Ok(())
 }
 
@@ -141,7 +129,10 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::checkout::tests::{git, scratch};
+    use crate::checkout::{
+        Checkout,
+        tests::{git, scratch},
+    };
 
     /// `main` holds a root commit, then a merge of a commit naming people in trailers.
     #[sqlx::test]
@@ -172,7 +163,11 @@ mod tests {
             rows.sort();
             rows
         };
-        record(&db, &checkout, vec![main]).await.unwrap();
+        let record = || {
+            let db = db.clone();
+            checkout.read(move |repo| record(&db, repo, vec![main]))
+        };
+        record().await.unwrap();
         let recorded = rows().await;
         assert_eq!(
             recorded,
@@ -189,7 +184,7 @@ mod tests {
                 "root 330: committer 0 A <a@example.com>",
             ]
         );
-        record(&db, &checkout, vec![main]).await.unwrap();
+        record().await.unwrap();
         assert_eq!(rows().await, recorded);
         fs::remove_dir_all(work).unwrap();
     }

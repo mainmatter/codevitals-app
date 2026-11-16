@@ -10,11 +10,11 @@
 
 mod accounts;
 mod app;
+mod changes;
 mod checkout;
 mod commits;
 mod limits;
-#[cfg(test)]
-mod schema;
+mod mainline;
 mod sign_in;
 mod sync;
 
@@ -67,6 +67,9 @@ struct Config {
     /// Directory for a bare git checkout of each repository. Made readable by this user only.
     #[arg(long = "checkout-dir", value_name = "DIR")]
     checkouts: PathBuf,
+    /// A branch to track besides the repository's default branch. Repeatable.
+    #[arg(long = "tracked-branch", value_name = "REPOSITORY_ID:BRANCH", value_parser = tracked_branch)]
+    tracked_branches: Vec<(RepositoryId, String)>,
 
     /// The app's ID.
     #[arg(long)]
@@ -190,6 +193,16 @@ fn read_secret(path: &str) -> std::io::Result<SecretString> {
     Ok(std::fs::read_to_string(path)?.trim_end().into())
 }
 
+fn tracked_branch(value: &str) -> Result<(RepositoryId, String)> {
+    let (repository, branch) = value.split_once(':').ok_or("not REPOSITORY_ID:BRANCH")?;
+    Ok((RepositoryId(repository.parse()?), branch.to_owned()))
+}
+
+/// Runs `future` from blocking code, as [`checkout::Checkout::read`] runs sync's git work.
+fn wait<F: Future>(future: F) -> F::Output {
+    tokio::runtime::Handle::current().block_on(future)
+}
+
 /// Every item of GitHub's list at `path`. Fails past `limit` items.
 async fn list<T: DeserializeOwned>(github: &Octocrab, path: &str, limit: usize) -> Result<Vec<T>> {
     // GitHub's maximum.
@@ -229,7 +242,9 @@ mod tests {
         const SIGNED: &str =
             "sha256=f101961424ae12c9b9d55cd4e562f4040c27ff1b9a8b7d2c4ba5cfc15e62d54f";
 
-        let router = router(sync::tests::app().0);
+        // A ping names no repository, so GitHub is never asked.
+        let github = sync::tests::github(|_| async { (StatusCode::NOT_FOUND, Default::default()) });
+        let router = router(sync::tests::app(github));
 
         for (signature, body, status) in [
             (SIGNED, PING.into(), StatusCode::ACCEPTED),

@@ -27,3 +27,6 @@ pub const COMMITS: usize = 2_000_000;
 pub const EMAILS_PER_QUERY: usize = 100;
 /// An author and co-authors, as GitHub lists them: its maximum page.
 pub const AUTHORS_PER_COMMIT: usize = 100;
+
+/// The paths of entries that differ between two commits, trees included, summed.
+pub const CHANGED_PATH_BYTES: usize = 64 << 20;

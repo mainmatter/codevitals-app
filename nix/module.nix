@@ -44,6 +44,15 @@ in
       description = "File holding the app's client secret.";
     };
 
+    trackedBranches = mkOption {
+      type = types.attrsOf (types.listOf types.str);
+      default = { };
+      example = {
+        "123456789" = [ "release" ];
+      };
+      description = "Branches to track besides each repository's default branch, by repository ID.";
+    };
+
     webhookSecretFile = mkOption {
       type = types.str;
       description = "File holding the app's webhook secret.";
@@ -77,17 +86,24 @@ in
       ];
 
       serviceConfig = {
-        ExecStart = lib.escapeShellArgs [
-          (lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.default)
-          "--listen=${cfg.listen}"
-          "--database-url=postgres:///cv?host=/run/postgresql&user=cv"
-          "--checkout-dir=%S/cv"
-          "--app-id=${toString cfg.appId}"
-          "--client-id=${cfg.clientId}"
-          "--private-key-file=%d/private-key"
-          "--client-secret-file=%d/client-secret"
-          "--webhook-secret-file=%d/webhook-secret"
-        ];
+        ExecStart = lib.escapeShellArgs (
+          [
+            (lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.default)
+            "--listen=${cfg.listen}"
+            "--database-url=postgres:///cv?host=/run/postgresql&user=cv"
+            "--checkout-dir=%S/cv"
+            "--app-id=${toString cfg.appId}"
+            "--client-id=${cfg.clientId}"
+            "--private-key-file=%d/private-key"
+            "--client-secret-file=%d/client-secret"
+            "--webhook-secret-file=%d/webhook-secret"
+          ]
+          ++ lib.concatLists (
+            lib.mapAttrsToList (
+              repository: map (branch: "--tracked-branch=${repository}:${branch}")
+            ) cfg.trackedBranches
+          )
+        );
         # Copies the secrets somewhere only this service can read them, as `%d/<name>`.
         LoadCredential = [
           "private-key:${cfg.privateKeyFile}"

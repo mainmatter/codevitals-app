@@ -3,7 +3,7 @@
 -- Content (commits, the people on them, diffs, the accounts of their emails) is keyed by content
 -- and shared by every repository and branch that reaches it. What is per repository (branches)
 -- refers to content and goes with its `repo` row. A row is inserted whole and never updated,
--- except `repo.full_name`.
+-- except `repo.full_name`; `mainline` rows are deleted and inserted.
 
 -- Object ids, raw. gix hashes with SHA-1.
 CREATE DOMAIN sha AS bytea CHECK (octet_length(VALUE) = 20);
@@ -73,9 +73,9 @@ CREATE TABLE change (
 
 -- # Branches
 
--- A tracked branch's first-parent history: `seq` counts from its root commit, 0. Rows only ever
--- extend it, so sync fails on a force-push: on a row that should exist but conflicts, or on a row
--- that exists but should not, as after a rewind.
+-- A tracked branch's first-parent history: `seq` counts from its root commit, 0. Replaced whole, in
+-- one transaction, whenever the tip moves, so a reader sees one history, never a mixture. Each
+-- commit's diff against its first parent is in `change` first.
 CREATE TABLE mainline (
     repo bigint NOT NULL REFERENCES repo ON DELETE CASCADE,
     branch text NOT NULL,

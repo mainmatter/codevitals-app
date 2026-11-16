@@ -54,7 +54,6 @@
               fileset = lib.fileset.unions [
                 (craneLib.fileset.commonCargoSources ./.)
                 ./migrations
-                ./src/testdata
               ];
             };
             strictDeps = true;
