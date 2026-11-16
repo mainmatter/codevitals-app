@@ -3,14 +3,23 @@
 // - Setup URL `https://<host>/setup`, with "Redirect on update" checked.
 // - "Request user authorization (OAuth) during installation" unchecked.
 // - Webhook URL `https://<host>/webhook`, with a random secret.
+// - Read access to contents, metadata and pull requests.
+// - Subscribed to "Push", "Pull request" and "Repository": these decide what triggers a sync.
 
 #![forbid(unsafe_code)]
 
 mod app;
+mod limits;
 mod sign_in;
 mod sync;
 
-use std::{error::Error, future::IntoFuture, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    error::Error,
+    future::IntoFuture,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     Router,
@@ -21,14 +30,14 @@ use axum::{
 use clap::Parser;
 use octocrab::{
     Octocrab,
+    models::RepositoryId,
     secrecy::{ExposeSecret, SecretString},
 };
 use tokio::{
     net::TcpListener,
     signal::unix::{SignalKind, signal},
-    sync::mpsc::{self, Sender},
+    sync::Semaphore,
 };
-use tokio_util::sync::CancellationToken;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::{Level, info, info_span};
 use tracing_subscriber::EnvFilter;
@@ -67,7 +76,21 @@ struct App {
     github: Octocrab,
     /// Signs people in, on github.com rather than api.github.com.
     oauth: Octocrab,
-    jobs: Sender<sync::Job>,
+    /// Repositories with a sync waiting or running; `true` asks for one more.
+    pending: Mutex<HashMap<RepositoryId, bool>>,
+    permits: Semaphore,
+}
+
+impl App {
+    fn new(config: Config, github: Octocrab, oauth: Octocrab) -> Arc<App> {
+        Arc::new(App {
+            config,
+            github,
+            oauth,
+            pending: Mutex::default(),
+            permits: Semaphore::new(limits::CONCURRENT_SYNCS),
+        })
+    }
 }
 
 #[tokio::main]
@@ -79,7 +102,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // octocrab waits forever by default, and one stalled request would stall all syncing.
     let client = || {
-        let timeout = Some(Duration::from_secs(30));
+        let timeout = Some(limits::GITHUB_REQUEST);
 
         Octocrab::builder()
             .set_connect_timeout(timeout)
@@ -92,36 +115,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .add_header(ACCEPT, "application/json".into())
         .build()?;
 
-    let (jobs, queue) = mpsc::channel(1024);
-    let stop = CancellationToken::new();
-    let resync = stop.run_until_cancelled(sync::resync(github.clone(), jobs.clone()));
-    let work = sync::work(github.clone(), queue, stop.clone());
-
     let listener = TcpListener::bind(config.listen).await?;
     info!(address = %config.listen, "listening");
-    let app = App {
-        config,
-        github,
-        oauth,
-        jobs,
-    };
-    let serve = axum::serve(listener, router(app)).with_graceful_shutdown(shutdown(stop.clone()));
-
-    // Polled together here rather than spawned, so that a panic in any of them unwinds out of
-    // `main` and ends the process. On shutdown, the server finishes the requests in flight and
-    // the worker its job in progress.
-    let (served, (), _) = tokio::join!(serve.into_future(), work, resync);
-    Ok(served?)
+    let app = App::new(config, github, oauth);
+    tokio::spawn(sync::resync(app.clone()));
+    // Running syncs are dropped on shutdown; the next run completes their work.
+    let serve = axum::serve(listener, router(app)).with_graceful_shutdown(shutdown());
+    Ok(serve.into_future().await?)
 }
 
-fn router(app: App) -> Router {
+fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/setup", get(sign_in::setup))
         .route("/callback", get(sign_in::callback))
-        // GitHub sends up to 25 MB; axum accepts 2 MB by default.
+        // axum accepts 2 MB by default.
         .route(
             "/webhook",
-            post(sync::webhook).layer(DefaultBodyLimit::max(25 << 20)),
+            post(sync::webhook).layer(DefaultBodyLimit::max(limits::WEBHOOK_BODY)),
         )
         .layer(
             TraceLayer::new_for_http()
@@ -138,18 +148,17 @@ fn router(app: App) -> Router {
                 })
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
-        .with_state(Arc::new(app))
+        .with_state(app)
 }
 
-/// Waits for Ctrl-C or SIGTERM, then tells the worker and resync to stop.
-async fn shutdown(stop: CancellationToken) {
+/// Waits for Ctrl-C or SIGTERM.
+async fn shutdown() {
     let mut terminate = signal(SignalKind::terminate()).expect("a SIGTERM handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
     }
     info!("shutting down");
-    stop.cancel();
 }
 
 #[cfg(test)]
@@ -175,20 +184,7 @@ mod tests {
         const SIGNED: &str =
             "sha256=f101961424ae12c9b9d55cd4e562f4040c27ff1b9a8b7d2c4ba5cfc15e62d54f";
 
-        let config = Config {
-            listen: ([127, 0, 0, 1], 0).into(),
-            app_id: 1,
-            client_id: "unused".into(),
-            private_key: "unused".into(),
-            client_secret: "unused".into(),
-            webhook_secret: "secret".into(),
-        };
-        let router = router(App {
-            config,
-            github: Octocrab::default(),
-            oauth: Octocrab::default(),
-            jobs: mpsc::channel(1).0,
-        });
+        let router = router(sync::tests::app().0);
 
         for (signature, body, status) in [
             (SIGNED, PING.into(), StatusCode::ACCEPTED),

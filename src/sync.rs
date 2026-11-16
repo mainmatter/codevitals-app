@@ -1,10 +1,15 @@
-//! Handing webhook events and repository syncs to the app.
+//! When and for which repositories `app::sync` and `app::forget` run.
+//!
+//! 1. A [`webhook`] delivery, startup and an hourly [`resync`] name repositories that may have
+//!    changed. Nothing else is taken from a delivery, so repeated or reordered deliveries are
+//!    harmless and lost ones are made up by the resync, except a lost removal: the resync only
+//!    sees what exists.
+//! 2. [`schedule`] runs at most one sync per repository at a time. Any number of triggers during
+//!    one cause exactly one more.
+//! 3. [`run`] asks GitHub which installation of the app sees the repository, and syncs it as that
+//!    installation, or forgets it if none does.
 
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::Bytes,
@@ -12,44 +17,22 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use octocrab::{
-    Octocrab,
+    Octocrab, Page,
     models::{
-        InstallationId, Repository,
-        webhook_events::{
-            EventInstallation, WebhookEvent, WebhookEventPayload,
-            payload::{InstallationRepositoriesWebhookEventAction, InstallationWebhookEventAction},
-            verification::verify_signature,
-        },
+        Installation, InstallationId, Repository, RepositoryId,
+        webhook_events::{WebhookEvent, WebhookEventPayload, verification::verify_signature},
     },
     secrecy::ExposeSecret,
 };
-use tokio::{
-    sync::mpsc::{Receiver, Sender},
-    time::{MissedTickBehavior, timeout},
-};
-use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Span, info, info_span, warn};
+use serde::de::DeserializeOwned;
+use tokio::time::timeout;
+use tracing::{Instrument, info_span, warn};
 
-use crate::{App, app};
+use crate::{App, app, limits};
 
-pub type Result = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+// 1. Triggers
 
-/// How often every installation is synced.
-const RESYNC_EVERY: Duration = Duration::from_secs(60 * 60);
-/// How long each call to the app's `on_event` or `sync` may take before it is cancelled.
-const APP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-
-/// Work for the app within one installation: an event to hand to it, then perhaps a sync of
-/// every repository.
-pub struct Job {
-    installation: InstallationId,
-    event: Option<Box<WebhookEvent>>,
-    sync: bool,
-    /// Where the job came from, so that what it logs can be traced back there.
-    span: Span,
-}
-
-/// `POST /webhook`: GitHub reports an event. Queues it for the app.
+/// `POST /webhook`
 pub async fn webhook(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> StatusCode {
     let header = |name| {
         headers
@@ -57,13 +40,13 @@ pub async fn webhook(State(app): State<Arc<App>>, headers: HeaderMap, body: Byte
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
     };
-
     let secret = app.config.webhook_secret.expose_secret();
     if let Err(error) = verify_signature(header("x-hub-signature-256"), secret, &body) {
         warn!(%error, "webhook rejected");
         return StatusCode::UNAUTHORIZED;
     }
 
+    // Parsed in full, so that malformed deliveries are rejected.
     let event = match WebhookEvent::try_from_header_and_body(header("x-github-event"), &body) {
         Ok(event) => event,
         Err(error) => {
@@ -71,117 +54,281 @@ pub async fn webhook(State(app): State<Arc<App>>, headers: HeaderMap, body: Byte
             return StatusCode::BAD_REQUEST;
         }
     };
-    // Only `ping` comes from outside any installation.
-    let Some(installation) = event.installation.as_ref().map(EventInstallation::id) else {
-        return StatusCode::ACCEPTED;
-    };
-
-    // New installations and newly added repositories start out with a sync.
-    let sync = match &event.specific {
-        WebhookEventPayload::Installation(payload) => matches!(
-            payload.action,
-            InstallationWebhookEventAction::Created | InstallationWebhookEventAction::Unsuspend
-        ),
+    let named = match event.specific {
+        WebhookEventPayload::Installation(payload) => payload.repositories.unwrap_or_default(),
         WebhookEventPayload::InstallationRepositories(payload) => {
-            payload.action == InstallationRepositoriesWebhookEventAction::Added
+            [payload.repositories_added, payload.repositories_removed].concat()
         }
-        _ => false,
+        _ => Vec::new(),
     };
-
-    let job = Job {
-        installation,
-        event: Some(Box::new(event)),
-        sync,
-        span: Span::current(),
-    };
-    match app.jobs.try_send(job) {
-        Ok(()) => StatusCode::ACCEPTED,
-        Err(error) => {
+    let repositories = (event.repository.map(|repository| repository.id).into_iter())
+        .chain(named.into_iter().map(|repository| repository.id));
+    for repository in repositories {
+        if let Err(error) = schedule(&app, repository) {
             warn!(%error, "webhook turned away");
-            StatusCode::SERVICE_UNAVAILABLE
+            return StatusCode::SERVICE_UNAVAILABLE;
         }
     }
+    StatusCode::ACCEPTED
 }
 
-/// Queues a sync of every installation now, and again every [`RESYNC_EVERY`]. GitHub never retries
-/// a failed webhook delivery, so this is what catches up on downtime and turned-away events.
-pub async fn resync(github: Octocrab, jobs: Sender<Job>) {
+/// GitHub never redelivers a failed webhook; this catches up.
+const RESYNC_EVERY: Duration = Duration::from_secs(60 * 60);
+
+pub async fn resync(app: Arc<App>) {
     let mut interval = tokio::time::interval(RESYNC_EVERY);
-    // After a resync held up by a full queue, wait a whole period rather than catching up.
-    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        if let Err(error) = queue_installations(&github, &jobs).await {
+        if let Err(error) = schedule_all(&app).await {
             warn!(%error, "resync failed");
         }
     }
 }
 
-async fn queue_installations(github: &Octocrab, jobs: &Sender<Job>) -> Result {
-    let page = github.apps().installations().per_page(100).send().await?;
-    let installations = github.all_pages(page).await?;
-    info!(installations = installations.len(), "resyncing");
-
-    let span = info_span!("resync");
-    for installation in installations {
-        let job = Job {
-            installation: installation.id,
-            event: None,
-            sync: true,
-            span: span.clone(),
-        };
-        jobs.send(job).await?;
+async fn schedule_all(app: &Arc<App>) -> Result {
+    let apps = app.github.apps();
+    let page = apps.installations().per_page(PER_PAGE as u8).send().await?;
+    for installation in all_pages(&app.github, page, limits::INSTALLATIONS).await? {
+        // One at a time, so that a suspended installation does not hold up the others.
+        if let Err(error) = schedule_installation(app, installation.id).await {
+            warn!(installation = installation.id.0, %error, "resync failed");
+        }
     }
     Ok(())
 }
 
-/// Runs jobs one at a time until `stop`, finishing the job in progress.
-pub async fn work(github: Octocrab, mut jobs: Receiver<Job>, stop: CancellationToken) {
-    let mut installations = HashMap::new();
-    while let Some(Some(job)) = stop.run_until_cancelled(jobs.recv()).await {
-        let span = info_span!(parent: &job.span, "job", installation = job.installation.0);
-        let started = Instant::now();
-        match run(&github, &mut installations, job)
-            .instrument(span.clone())
-            .await
+async fn schedule_installation(app: &Arc<App>, installation: InstallationId) -> Result {
+    let github = app.github.installation(installation)?;
+    let page = github.get(
+        "/installation/repositories",
+        Some(&[("per_page", PER_PAGE)]),
+    );
+    let repositories: Vec<Repository> =
+        all_pages(&github, page.await?, limits::REPOSITORIES).await?;
+    for repository in repositories {
+        schedule(app, repository.id)?;
+    }
+    Ok(())
+}
+
+// 2. Scheduling
+
+/// A trigger while a sync of `repository` waits or runs makes it run once more afterwards.
+fn schedule(app: &Arc<App>, repository: RepositoryId) -> Result {
+    let mut pending = app.pending.lock().unwrap();
+    if pending.len() >= limits::REPOSITORIES && !pending.contains_key(&repository) {
+        return Err("too many repositories".into());
+    }
+    if pending.insert(repository, true).is_none() {
+        tokio::spawn(run(app.clone(), repository));
+    }
+    Ok(())
+}
+
+async fn run(app: Arc<App>, repository: RepositoryId) {
+    loop {
+        // Per run, and handed out in order, so that busy repositories take turns with the rest.
+        let _permit = app.permits.acquire().await.unwrap();
         {
-            Ok(()) => span.in_scope(|| info!(elapsed = ?started.elapsed(), "done")),
-            Err(error) => span.in_scope(|| warn!(%error, "failed")),
+            let mut pending = app.pending.lock().unwrap();
+            if !std::mem::take(pending.get_mut(&repository).unwrap()) {
+                pending.remove(&repository);
+                return;
+            }
+        }
+        let synced = async {
+            match context(&app.github, repository).await? {
+                Some(context) => app::sync(&context).await,
+                None => app::forget(repository).await,
+            }
+        };
+        let span = info_span!("sync", repository = repository.0);
+        let synced = timeout(limits::SYNC_TIMEOUT, synced).instrument(span).await;
+        if let Err(error) = synced.unwrap_or_else(|elapsed| Err(elapsed.into())) {
+            warn!(repository = repository.0, %error, "sync failed");
         }
     }
 }
 
-/// Keeps one client per installation in `installations`, so that its token is reused.
-async fn run(
+// 3. Sync or forget
+
+/// `None` if GitHub answers 404: no installation of the app sees the repository.
+///
+/// `/repositories/{id}` is an undocumented alias of `/repos/{owner}/{repo}`, stable for years.
+async fn context(github: &Octocrab, repository: RepositoryId) -> Result<Option<app::Context>> {
+    let found = async {
+        let path = format!("/repositories/{}/installation", repository.0);
+        let installation: Installation = github.get(path, None::<&()>).await?;
+        let (github, token) = github.installation_and_token(installation.id).await?;
+        let found = github.repos_by_id(repository).get().await?;
+        Ok((github, token, found))
+    };
+    let (github, token, found) = match found.await {
+        Err(octocrab::Error::GitHub { source, .. }) if source.status_code == 404 => {
+            return Ok(None);
+        }
+        found => found?,
+    };
+    Ok(Some(app::Context {
+        repository,
+        full_name: found.full_name.ok_or("no full name")?,
+        default_branch: found.default_branch.ok_or("no default branch")?,
+        github,
+        token,
+    }))
+}
+
+// Plumbing
+
+pub type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// GitHub's maximum.
+const PER_PAGE: usize = 100;
+
+/// Fails past `limit` items.
+async fn all_pages<T: DeserializeOwned>(
     github: &Octocrab,
-    installations: &mut HashMap<InstallationId, Octocrab>,
-    job: Job,
-) -> Result {
-    let github = match installations.entry(job.installation) {
-        Entry::Occupied(entry) => entry.into_mut(),
-        Entry::Vacant(entry) => entry.insert(github.installation(job.installation)?),
+    mut page: Page<T>,
+    limit: usize,
+) -> Result<Vec<T>> {
+    let mut items = Vec::new();
+    for _ in 0..limit.div_ceil(PER_PAGE) {
+        items.append(&mut page.items);
+        match github.get_page(&page.next).await? {
+            Some(next) => page = next,
+            None => return Ok(items),
+        }
+    }
+    Err(format!("more than {limit} items").into())
+}
+
+#[cfg(test)]
+pub mod tests {
+    use std::{
+        convert::Infallible,
+        sync::atomic::{AtomicUsize, Ordering},
     };
 
-    if let Some(event) = job.event {
-        timeout(APP_TIMEOUT, app::on_event(github, *event)).await??;
-    }
-    if job.sync {
-        sync(github).await?;
-    }
-    Ok(())
-}
+    use axum::http::{Request, Response, Uri};
+    use octocrab::{
+        AuthState, EncodingKey, OctoBody, OctocrabBuilder, auth::AppAuth,
+        service::middleware::base_uri::BaseUriLayer,
+    };
+    use serde_json::json;
+    use tokio::sync::Semaphore;
+    use tower::service_fn;
 
-/// Syncs every repository of the installation `github` acts as.
-async fn sync(github: &Octocrab) -> Result {
-    let page = github.get("/installation/repositories", Some(&[("per_page", 100)]));
-    for repository in github.all_pages::<Repository>(page.await?).await? {
-        let span = info_span!("repository", name = repository.full_name);
-        let synced = timeout(APP_TIMEOUT, app::sync(github, &repository)).instrument(span.clone());
-        match synced.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => span.in_scope(|| warn!(%error, "sync failed")),
-            Err(elapsed) => span.in_scope(|| warn!(error = %elapsed, "sync failed")),
+    use super::*;
+
+    const REPOSITORY: RepositoryId = RepositoryId(42);
+
+    #[tokio::test]
+    async fn pushes_during_a_sync_cause_one_more() {
+        let (app, fake) = app();
+        for _ in 0..10 {
+            schedule(&app, REPOSITORY).unwrap();
+            settle().await;
+        }
+        fake.release.add_permits(10);
+        settle().await;
+        assert_eq!(fake.reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_uninstalled_repository_is_forgotten() {
+        let (app, _) = app();
+        let context = context(&app.github, RepositoryId(43)).await;
+        assert!(context.unwrap().is_none());
+    }
+
+    /// GitHub where installation 7 sees only [`REPOSITORY`]. Each read of it is counted, then
+    /// held until `release`.
+    pub struct Fake {
+        reads: AtomicUsize,
+        release: Semaphore,
+    }
+
+    pub fn app() -> (Arc<App>, Arc<Fake>) {
+        let fake = Arc::new(Fake {
+            reads: AtomicUsize::new(0),
+            release: Semaphore::new(0),
+        });
+        let faked = fake.clone();
+        let github = service_fn(move |request: Request<OctoBody>| {
+            let fake = faked.clone();
+            async move {
+                let path = request.uri().path();
+                let (status, body) = if path == "/repositories/42/installation" {
+                    (StatusCode::OK, installation())
+                } else if path == "/app/installations/7/access_tokens" {
+                    let token = json!({
+                        "token": "t",
+                        "expires_at": "2099-01-01T00:00:00Z",
+                        "permissions": {},
+                    });
+                    (StatusCode::CREATED, token)
+                } else if path == "/repositories/42" {
+                    fake.reads.fetch_add(1, Ordering::SeqCst);
+                    fake.release.acquire().await.unwrap().forget();
+                    let repository = json!({
+                        "id": 42,
+                        "name": "r",
+                        "full_name": "o/r",
+                        "default_branch": "main",
+                        "url": "https://api.github.com/repos/o/r",
+                    });
+                    (StatusCode::OK, repository)
+                } else {
+                    (StatusCode::NOT_FOUND, json!({ "message": "Not Found" }))
+                };
+                let response = Response::builder().status(status);
+                Ok::<_, Infallible>(response.body(body.to_string()).unwrap())
+            }
+        });
+
+        let key = EncodingKey::from_rsa_pem(include_bytes!("testdata/fake-app-key.pem")).unwrap();
+        let auth = AuthState::App(AppAuth {
+            app_id: 1.into(),
+            key,
+        });
+        let github = OctocrabBuilder::new_empty()
+            .with_service(github)
+            .with_layer(&BaseUriLayer::new(Uri::from_static("http://github.test")))
+            .with_auth(auth)
+            .build()
+            .unwrap();
+        let config = crate::Config {
+            listen: ([127, 0, 0, 1], 0).into(),
+            app_id: 1,
+            client_id: "unused".into(),
+            private_key: "unused".into(),
+            client_secret: "unused".into(),
+            webhook_secret: "secret".into(),
+        };
+        let app = App::new(config, github.clone(), github);
+        (app, fake)
+    }
+
+    fn installation() -> serde_json::Value {
+        let url = "https://github.test";
+        json!({
+            "id": 7,
+            "account": {
+                "login": "o", "id": 1, "node_id": "n", "gravatar_id": "", "type": "User",
+                "site_admin": false, "avatar_url": url, "url": url, "html_url": url,
+                "followers_url": url, "following_url": url, "gists_url": url, "starred_url": url,
+                "subscriptions_url": url, "organizations_url": url, "repos_url": url,
+                "events_url": url, "received_events_url": url,
+            },
+            "permissions": {},
+            "events": [],
+        })
+    }
+
+    /// Runs every other task until it waits. Tests run on one thread.
+    async fn settle() {
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
         }
     }
-    Ok(())
 }
