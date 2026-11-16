@@ -1,9 +1,9 @@
 -- What `sync` derives from a repository's mirror and from GitHub.
 --
--- Content (commits, the people on them, diffs) is keyed by content and shared by every repository
--- and branch that reaches it. What is per repository (branches) refers to content and goes with
--- its `repo` row. A row is inserted whole and never
--- updated, except `repo.full_name`.
+-- Content (commits, the people on them, diffs, the accounts of their emails) is keyed by content
+-- and shared by every repository and branch that reaches it. What is per repository (branches)
+-- refers to content and goes with its `repo` row. A row is inserted whole and never updated,
+-- except `repo.full_name`.
 
 -- Object ids, raw. gix hashes with SHA-1.
 CREATE DOMAIN sha AS bytea CHECK (octet_length(VALUE) = 20);
@@ -40,11 +40,7 @@ CREATE TABLE commit_person (
     position int NOT NULL CHECK (position >= 0 AND (role LIKE '%-by' OR position = 0)),
     name text NOT NULL,
     email text NOT NULL,
-    -- The GitHub user this email belonged to when the commit was recorded, if any.
-    account_id bigint,
-    account_login text,
-    PRIMARY KEY (commit, role, position),
-    CHECK (num_nulls(account_id, account_login) IN (0, 2))
+    PRIMARY KEY (commit, role, position)
 );
 
 -- # Diffs
@@ -119,22 +115,19 @@ WHERE new_oid IS NOT NULL;
 
 -- # People
 
--- Each `commit_person` row with `person`, who they are: their GitHub account where known;
--- otherwise the one account their email belonged to on any other commit; otherwise their email,
--- lowercased. Rows keep what GitHub knew when they were recorded, so this carries an email
--- verified later back to older commits. Names are never matched, and an email seen with two
--- accounts stays unmerged.
+-- The GitHub account an email belonged to when GitHub was asked, or null for none. GitHub links
+-- commits to accounts by email, so this is the one link from git to a person. Asked about: emails
+-- in the roles GitHub attributes, `author`, `committer` and `co-authored-by`.
+CREATE TABLE email_account (
+    email text PRIMARY KEY CHECK (email = lower(email)),
+    account_id bigint,
+    account_login text,
+    CHECK (num_nulls(account_id, account_login) IN (0, 2))
+);
+
+-- Each `commit_person` row with `person`, who they are: their email's account if it has one,
+-- otherwise their email, lowercased. Names are never matched.
 CREATE VIEW commit_person_key AS
-WITH email_account AS (
-    SELECT lower(email) AS email, min(account_id) AS account_id
-    FROM commit_person
-    WHERE account_id IS NOT NULL
-    GROUP BY lower(email)
-    HAVING count(DISTINCT account_id) = 1
-)
-SELECT
-    p.*,
-    coalesce('account:' || coalesce(p.account_id, e.account_id), 'email:' || lower(p.email))
-        AS person
+SELECT p.*, coalesce('account:' || a.account_id, 'email:' || lower(p.email)) AS person
 FROM commit_person p
-LEFT JOIN email_account e ON e.email = lower(p.email);
+LEFT JOIN email_account a ON a.email = lower(p.email);

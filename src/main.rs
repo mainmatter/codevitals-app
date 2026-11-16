@@ -8,12 +8,9 @@
 
 #![forbid(unsafe_code)]
 
+mod accounts;
 mod app;
 mod checkout;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "a later step of `sync` calls it")
-)]
 mod commits;
 mod limits;
 #[cfg(test)]

@@ -22,3 +22,8 @@ pub const OBJECT_BYTES: usize = 512 << 20;
 
 /// Reachable from one set of tips. Linux has about 1.4 million.
 pub const COMMITS: usize = 2_000_000;
+
+/// Commits looked up in one GitHub GraphQL query.
+pub const EMAILS_PER_QUERY: usize = 100;
+/// An author and co-authors, as GitHub lists them: its maximum page.
+pub const AUTHORS_PER_COMMIT: usize = 100;

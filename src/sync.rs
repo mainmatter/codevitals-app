@@ -155,9 +155,9 @@ async fn context(github: &Octocrab, repository: RepositoryId) -> Result<Option<a
         let installation: Installation = github.get(path, None::<&()>).await?;
         let (github, token) = github.installation_and_token(installation.id).await?;
         let found = github.repos_by_id(repository).get().await?;
-        Ok((token, found))
+        Ok((github, token, found))
     };
-    let (token, found) = match found.await {
+    let (github, token, found) = match found.await {
         Err(octocrab::Error::GitHub { source, .. }) if source.status_code == 404 => {
             return Ok(None);
         }
@@ -169,6 +169,8 @@ async fn context(github: &Octocrab, repository: RepositoryId) -> Result<Option<a
     Ok(Some(app::Context {
         repository,
         full_name: found.full_name.ok_or("no full name")?,
+        default_branch: found.default_branch.ok_or("no default branch")?,
+        github,
         token,
     }))
 }
@@ -185,7 +187,7 @@ pub mod tests {
         AuthState, EncodingKey, OctoBody, OctocrabBuilder, auth::AppAuth,
         service::middleware::base_uri::BaseUriLayer,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::sync::Semaphore;
     use tower::service_fn;
 
@@ -218,11 +220,15 @@ pub mod tests {
             release: Semaphore::new(0),
         });
         let faked = fake.clone();
-        let github = service_fn(move |request: Request<OctoBody>| {
-            let fake = faked.clone();
+        let key = EncodingKey::from_rsa_pem(include_bytes!("testdata/fake-app-key.pem")).unwrap();
+        let auth = AuthState::App(AppAuth {
+            app_id: 1.into(),
+            key,
+        });
+        let github = github(auth, move |request| {
+            let (fake, path) = (faked.clone(), request.uri().path().to_owned());
             async move {
-                let path = request.uri().path();
-                let (status, body) = if path == "/repositories/42/installation" {
+                if path == "/repositories/42/installation" {
                     (StatusCode::OK, installation())
                 } else if path == "/app/installations/7/access_tokens" {
                     let token = json!({
@@ -245,23 +251,9 @@ pub mod tests {
                     (StatusCode::OK, repository)
                 } else {
                     (StatusCode::NOT_FOUND, json!({ "message": "Not Found" }))
-                };
-                let response = Response::builder().status(status);
-                Ok::<_, Infallible>(response.body(body.to_string()).unwrap())
+                }
             }
         });
-
-        let key = EncodingKey::from_rsa_pem(include_bytes!("testdata/fake-app-key.pem")).unwrap();
-        let auth = AuthState::App(AppAuth {
-            app_id: 1.into(),
-            key,
-        });
-        let github = OctocrabBuilder::new_empty()
-            .with_service(github)
-            .with_layer(&BaseUriLayer::new(Uri::from_static("http://github.test")))
-            .with_auth(auth)
-            .build()
-            .unwrap();
         let config = crate::Config {
             listen: ([127, 0, 0, 1], 0).into(),
             database: "postgres://unused".parse().unwrap(),
@@ -276,7 +268,31 @@ pub mod tests {
         (app, fake)
     }
 
-    fn installation() -> serde_json::Value {
+    /// GitHub at `http://github.test`, answering every request with `answer`.
+    pub fn github<A>(
+        auth: AuthState,
+        answer: impl Fn(Request<OctoBody>) -> A + Clone + Send + Sync + 'static,
+    ) -> Octocrab
+    where
+        A: Future<Output = (StatusCode, Value)> + Send + 'static,
+    {
+        let service = service_fn(move |request| {
+            let answered = answer(request);
+            async move {
+                let (status, body) = answered.await;
+                let response = Response::builder().status(status);
+                Ok::<_, Infallible>(response.body(body.to_string()).unwrap())
+            }
+        });
+        OctocrabBuilder::new_empty()
+            .with_service(service)
+            .with_layer(&BaseUriLayer::new(Uri::from_static("http://github.test")))
+            .with_auth(auth)
+            .build()
+            .unwrap()
+    }
+
+    fn installation() -> Value {
         let url = "https://github.test";
         json!({
             "id": 7,

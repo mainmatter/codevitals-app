@@ -1,4 +1,4 @@
-//! Records every commit reachable from a set of tips, with everyone on it.
+//! Records every commit reachable from a set of tips, with everyone on it, and returns them.
 //!
 //! 1. [`reachable`]: the commits that should have a row.
 //! 2. [`missing`]: those without one.
@@ -17,15 +17,19 @@ use tokio::runtime::Handle;
 
 use crate::{Result, checkout::Checkout, limits};
 
-pub async fn record(db: &PgPool, checkout: &Checkout, tips: Vec<ObjectId>) -> Result {
+pub async fn record(
+    db: &PgPool,
+    checkout: &Checkout,
+    tips: Vec<ObjectId>,
+) -> Result<Vec<ObjectId>> {
     let (db, checkout, runtime) = (db.clone(), checkout.clone(), Handle::current());
     tokio::task::spawn_blocking(move || {
         let repo = checkout.open()?;
-        let missing = runtime.block_on(missing(&db, &reachable(&repo, tips)?))?;
-        for sha in missing {
+        let reachable = reachable(&repo, tips)?;
+        for sha in runtime.block_on(missing(&db, &reachable))? {
             runtime.block_on(insert(&db, &repo, sha))?;
         }
-        Ok(())
+        Ok(reachable)
     })
     .await?
 }

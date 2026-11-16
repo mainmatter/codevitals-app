@@ -47,7 +47,7 @@ const PULLS: &str = "refs/pull/";
 const PULL_HEADS: &str = "refs/pull-heads/";
 
 /// Ref names and their commits.
-type Refs = HashMap<FullName, ObjectId>;
+pub type Refs = HashMap<FullName, ObjectId>;
 
 /// Creates `dir`, readable by this user only.
 pub fn prepare(dir: &Path) -> io::Result<()> {
@@ -64,9 +64,9 @@ impl Checkout {
         Self(dir.join(format!("{}.git", repository.0)))
     }
 
-    /// Returns only once the work has stopped, so the caller keeps the repository until then.
-    /// Past `FETCH_TIMEOUT`, asks the fetch to stop; it checks only while receiving the pack.
-    pub async fn update(&self, url: String, token: SecretString) -> Result {
+    /// Returns GitHub's refs, once the work has stopped, so the caller keeps the repository until
+    /// then. Past `FETCH_TIMEOUT`, asks the fetch to stop; it checks only while receiving the pack.
+    pub async fn update(&self, url: String, token: SecretString) -> Result<Refs> {
         let interrupt = Arc::new(AtomicBool::new(false));
         let mut worker = tokio::task::spawn_blocking({
             let (checkout, interrupt) = (self.clone(), interrupt.clone());
@@ -75,7 +75,8 @@ impl Checkout {
                 // Keeps the pull request heads the fetch is about to overwrite.
                 set_refs(&repo, refs(&repo)?)?;
                 let github = fetch(&repo, &url, token, &interrupt)?;
-                set_refs(&repo, github)
+                set_refs(&repo, github.clone())?;
+                Ok(github)
             }
         });
         if let Ok(done) = timeout(limits::FETCH_TIMEOUT, &mut worker).await {
