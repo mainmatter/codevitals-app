@@ -51,16 +51,36 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # The service signs in as the system user `cv`, over the socket, without a password. Analyses
+    # read as members of the built-in `pg_read_all_data`, which reads every database here.
+    services.postgresql = {
+      enable = true;
+      # The migrations rely on it. Conflicts with a host that picks another version on purpose.
+      package = pkgs.postgresql_18;
+      ensureDatabases = [ "cv" ];
+      ensureUsers = [
+        {
+          name = "cv";
+          ensureDBOwnership = true;
+        }
+      ];
+    };
+
     systemd.services.cv = {
       description = "cv";
       wantedBy = [ "multi-user.target" ];
       wants = [ "network-online.target" ];
-      after = [ "network-online.target" ];
+      requires = [ "postgresql.target" ];
+      after = [
+        "network-online.target"
+        "postgresql.target"
+      ];
 
       serviceConfig = {
         ExecStart = lib.escapeShellArgs [
           (lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.default)
           "--listen=${cfg.listen}"
+          "--database-url=postgres:///cv?host=/run/postgresql&user=cv"
           "--app-id=${toString cfg.appId}"
           "--client-id=${cfg.clientId}"
           "--private-key-file=%d/private-key"

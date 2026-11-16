@@ -46,11 +46,27 @@
     in
     {
       packages = forAllSystems (
-        { craneLib, ... }:
+        { pkgs, craneLib, ... }:
         {
           default = craneLib.buildPackage {
-            src = craneLib.cleanCargoSource ./.;
+            src = lib.fileset.toSource {
+              root = ./.;
+              fileset = lib.fileset.unions [
+                (craneLib.fileset.commonCargoSources ./.)
+                ./migrations
+                ./src/testdata
+              ];
+            };
             strictDeps = true;
+            nativeCheckInputs = [ pkgs.postgresql_18 ];
+            # A Postgres of the build's own, reachable only through a socket, as `#[sqlx::test]`
+            # expects.
+            preCheck = ''
+              export PGDATA="$TMPDIR/postgres" PGHOST="$TMPDIR/postgres"
+              export DATABASE_URL="postgres:///postgres?host=$PGHOST&user=postgres"
+              initdb --username=postgres --auth=trust --no-locale --encoding=UTF8 >/dev/null
+              pg_ctl start --silent --log="$PGDATA/log" -o "-c listen_addresses= -k $PGHOST"
+            '';
             meta.mainProgram = "cv";
           };
         }
@@ -65,7 +81,10 @@
           # What builds need, and nothing more.
           ci = pkgs.mkShell {
             name = "cv-ci";
-            packages = [ rustToolchain ];
+            packages = [
+              rustToolchain
+              pkgs.postgresql_18
+            ];
           };
 
           # Adds editor support, from the same Rust release.
@@ -90,7 +109,7 @@
           # Builds `cv`, running its tests, then fails unless `nix/module.nix` passes exactly the
           # flags `cv` takes.
           module-in-sync = pkgs.runCommand "module-in-sync" { } ''
-            diff -u <(${lib.getExe cv} --help | ${flags}) <(${flags} < ${./nix/module.nix})
+            diff -u <(${lib.getExe cv} --help | ${flags}) <(< ${./nix/module.nix} ${flags})
             touch $out
           '';
         }

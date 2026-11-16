@@ -10,6 +10,8 @@
 
 mod app;
 mod limits;
+#[cfg(test)]
+mod schema;
 mod sign_in;
 mod sync;
 
@@ -33,6 +35,10 @@ use octocrab::{
     models::RepositoryId,
     secrecy::{ExposeSecret, SecretString},
 };
+use sqlx::{
+    PgPool,
+    postgres::{PgConnectOptions, PgPoolOptions},
+};
 use tokio::{
     net::TcpListener,
     signal::unix::{SignalKind, signal},
@@ -48,6 +54,9 @@ struct Config {
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:3000")]
     listen: SocketAddr,
+    /// Postgres, e.g. `postgres:///cv?host=/run/postgresql`.
+    #[arg(long = "database-url", value_name = "URL")]
+    database: PgConnectOptions,
 
     /// The app's ID.
     #[arg(long)]
@@ -76,6 +85,7 @@ struct App {
     github: Octocrab,
     /// Signs people in, on github.com rather than api.github.com.
     oauth: Octocrab,
+    db: PgPool,
     /// Repositories with a sync waiting or running; `true` asks for one more.
     pending: Mutex<HashMap<RepositoryId, bool>>,
     permits: Semaphore,
@@ -83,10 +93,15 @@ struct App {
 
 impl App {
     fn new(config: Config, github: Octocrab, oauth: Octocrab) -> Arc<App> {
+        // A sync holds at most one connection at a time.
+        let db = PgPoolOptions::new()
+            .max_connections(limits::CONCURRENT_SYNCS as u32)
+            .connect_lazy_with(config.database.clone());
         Arc::new(App {
             config,
             github,
             oauth,
+            db,
             pending: Mutex::default(),
             permits: Semaphore::new(limits::CONCURRENT_SYNCS),
         })
@@ -115,9 +130,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .add_header(ACCEPT, "application/json".into())
         .build()?;
 
-    let listener = TcpListener::bind(config.listen).await?;
-    info!(address = %config.listen, "listening");
     let app = App::new(config, github, oauth);
+    sqlx::migrate!().run(&app.db).await?;
+
+    let listener = TcpListener::bind(app.config.listen).await?;
+    info!(address = %app.config.listen, "listening");
     tokio::spawn(sync::resync(app.clone()));
     // Running syncs are dropped on shutdown; the next run completes their work.
     let serve = axum::serve(listener, router(app)).with_graceful_shutdown(shutdown());

@@ -299,6 +299,7 @@ pub mod tests {
             .unwrap();
         let config = crate::Config {
             listen: ([127, 0, 0, 1], 0).into(),
+            database: "postgres://unused".parse().unwrap(),
             app_id: 1,
             client_id: "unused".into(),
             private_key: "unused".into(),
