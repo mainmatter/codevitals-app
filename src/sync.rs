@@ -17,17 +17,16 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use octocrab::{
-    Octocrab, Page,
+    Octocrab,
     models::{
         Installation, InstallationId, Repository, RepositoryId,
         webhook_events::{WebhookEvent, WebhookEventPayload, verification::verify_signature},
     },
     secrecy::ExposeSecret,
 };
-use serde::de::DeserializeOwned;
 use tracing::{Instrument, info_span, warn};
 
-use crate::{App, Result, app, limits};
+use crate::{App, OctocrabExt, Result, app, limits};
 
 // 1. Triggers
 
@@ -85,9 +84,11 @@ pub async fn resync(app: Arc<App>) {
 }
 
 async fn schedule_all(app: &Arc<App>) -> Result {
-    let apps = app.github.apps();
-    let page = apps.installations().per_page(PER_PAGE as u8).send().await?;
-    for installation in all_pages(&app.github, page, limits::INSTALLATIONS).await? {
+    let installations: Vec<Installation> = app
+        .github
+        .list("/app/installations", limits::INSTALLATIONS)
+        .await?;
+    for installation in installations {
         // One at a time, so that a suspended installation does not hold up the others.
         if let Err(error) = schedule_installation(app, installation.id).await {
             warn!(installation = installation.id.0, %error, "resync failed");
@@ -98,12 +99,9 @@ async fn schedule_all(app: &Arc<App>) -> Result {
 
 async fn schedule_installation(app: &Arc<App>, installation: InstallationId) -> Result {
     let github = app.github.installation(installation)?;
-    let page = github.get(
-        "/installation/repositories",
-        Some(&[("per_page", PER_PAGE)]),
-    );
-    let repositories: Vec<Repository> =
-        all_pages(&github, page.await?, limits::REPOSITORIES).await?;
+    let repositories: Vec<Repository> = github
+        .list("/installation/repositories", limits::REPOSITORIES)
+        .await?;
     for repository in repositories {
         schedule(app, repository.id)?;
     }
@@ -160,9 +158,9 @@ async fn context(github: &Octocrab, repository: RepositoryId) -> Result<Option<a
         let installation: Installation = github.get(path, None::<&()>).await?;
         let (github, token) = github.installation_and_token(installation.id).await?;
         let found = github.repos_by_id(repository).get().await?;
-        Ok((github, token, found))
+        Ok((token, found))
     };
-    let (github, token, found) = match found.await {
+    let (token, found) = match found.await {
         Err(octocrab::Error::GitHub { source, .. }) if source.status_code == 404 => {
             return Ok(None);
         }
@@ -174,32 +172,8 @@ async fn context(github: &Octocrab, repository: RepositoryId) -> Result<Option<a
     Ok(Some(app::Context {
         repository,
         full_name: found.full_name.ok_or("no full name")?,
-        default_branch: found.default_branch.ok_or("no default branch")?,
-        github,
         token,
     }))
-}
-
-// Plumbing
-
-/// GitHub's maximum.
-const PER_PAGE: usize = 100;
-
-/// Fails past `limit` items.
-async fn all_pages<T: DeserializeOwned>(
-    github: &Octocrab,
-    mut page: Page<T>,
-    limit: usize,
-) -> Result<Vec<T>> {
-    let mut items = Vec::new();
-    for _ in 0..limit.div_ceil(PER_PAGE) {
-        items.append(&mut page.items);
-        match github.get_page(&page.next).await? {
-            Some(next) => page = next,
-            None => return Ok(items),
-        }
-    }
-    Err(format!("more than {limit} items").into())
 }
 
 #[cfg(test)]

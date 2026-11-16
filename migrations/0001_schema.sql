@@ -31,12 +31,13 @@ CREATE TABLE commit (
     subject text NOT NULL
 );
 
--- Everyone on a commit, inserted with it. `author` rows are the git author at 0, then each
--- `Co-authored-by` trailer in order; the one `committer` row is at 0.
+-- Everyone on a commit, inserted with it: the one `author` and one `committer`, at 0, and each
+-- trailer whose key ends in `-by`, the key in lower case as `role`, numbered in order per role.
+-- Names and emails are as git wrote them.
 CREATE TABLE commit_person (
     commit sha NOT NULL REFERENCES commit,
-    role text NOT NULL CHECK (role IN ('author', 'committer')),
-    position int NOT NULL CHECK (position >= 0 AND (role = 'author' OR position = 0)),
+    role text NOT NULL CHECK (role IN ('author', 'committer') OR role LIKE '%-by'),
+    position int NOT NULL CHECK (position >= 0 AND (role LIKE '%-by' OR position = 0)),
     name text NOT NULL,
     email text NOT NULL,
     -- The GitHub user this email belonged to when the commit was recorded, if any.

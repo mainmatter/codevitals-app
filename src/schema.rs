@@ -89,7 +89,7 @@ async fn person_is_an_account_where_one_can_be_told(db: PgPool) {
                  -- Known to GitHub.
                  ({0}, 'author', 0, 'Ada', 'ada@example.com', 1, 'ada'),
                  -- The same email in other case, recorded before Ada verified it: Ada's account.
-                 ({1}, 'author', 1, 'A. L.', 'ADA@example.com', NULL, NULL),
+                 ({1}, 'co-authored-by', 0, 'A. L.', 'ADA@example.com', NULL, NULL),
                  -- An email seen with two accounts: not merged.
                  ({2}, 'author', 0, 'Bot', 'bot@example.com', 2, 'bot-a'),
                  ({3}, 'author', 0, 'Bot', 'bot@example.com', 3, 'bot-b'),

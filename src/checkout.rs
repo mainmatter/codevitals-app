@@ -1,6 +1,6 @@
 //! A bare checkout of each repository, the source of all code data.
 //!
-//! [`update`] fetches GitHub's branches and pull request heads, then makes the checkout's refs:
+//! [`Checkout::update`] fetches GitHub's branches and pull request heads, then makes the checkout's refs:
 //!
 //! - `refs/heads/*` and `refs/pull/*/head`: exactly GitHub's.
 //! - `refs/pull-heads/<oid>`: every pull request head the checkout has held, never deleted, so a
@@ -55,55 +55,62 @@ pub fn prepare(dir: &Path) -> io::Result<()> {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
 }
 
-/// Returns only once the work has stopped, so the caller keeps the repository until then. Past
-/// `FETCH_TIMEOUT`, asks the fetch to stop; it checks only while receiving the pack.
-pub async fn update(
-    dir: &Path,
-    repository: RepositoryId,
-    url: String,
-    token: SecretString,
-) -> Result {
-    let path = path(dir, repository);
-    let interrupt = Arc::new(AtomicBool::new(false));
-    let mut worker = tokio::task::spawn_blocking({
-        let interrupt = interrupt.clone();
-        move || {
-            let repo = open_or_init(&path)?;
-            // Keeps the pull request heads the fetch is about to overwrite.
-            set_refs(&repo, refs(&repo)?)?;
-            let github = fetch(&repo, &url, token, &interrupt)?;
-            set_refs(&repo, github)
+/// A repository's bare checkout, at this path.
+#[derive(Clone)]
+pub struct Checkout(pub PathBuf);
+
+impl Checkout {
+    pub fn new(dir: &Path, repository: RepositoryId) -> Self {
+        Self(dir.join(format!("{}.git", repository.0)))
+    }
+
+    /// Returns only once the work has stopped, so the caller keeps the repository until then.
+    /// Past `FETCH_TIMEOUT`, asks the fetch to stop; it checks only while receiving the pack.
+    pub async fn update(&self, url: String, token: SecretString) -> Result {
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let mut worker = tokio::task::spawn_blocking({
+            let (checkout, interrupt) = (self.clone(), interrupt.clone());
+            move || {
+                let repo = checkout.open_or_init()?;
+                // Keeps the pull request heads the fetch is about to overwrite.
+                set_refs(&repo, refs(&repo)?)?;
+                let github = fetch(&repo, &url, token, &interrupt)?;
+                set_refs(&repo, github)
+            }
+        });
+        if let Ok(done) = timeout(limits::FETCH_TIMEOUT, &mut worker).await {
+            return done?;
         }
-    });
-    if let Ok(done) = timeout(limits::FETCH_TIMEOUT, &mut worker).await {
-        return done?;
+        interrupt.store(true, Ordering::Relaxed);
+        worker.await?
     }
-    interrupt.store(true, Ordering::Relaxed);
-    worker.await?
-}
 
-pub async fn remove(dir: &Path, repository: RepositoryId) -> Result {
-    let path = path(dir, repository);
-    Ok(tokio::task::spawn_blocking(move || remove_dir(&path)).await??)
-}
-
-// 1. Open
-
-/// Initialised beside `path` and moved into place, so that `path` is never half a repository.
-fn open_or_init(path: &Path) -> Result<gix::Repository> {
-    if !path.exists() {
-        let new = path.with_added_extension("new");
-        remove_dir(&new)?;
-        gix::init_bare(&new)?;
-        fs::rename(&new, path)?;
+    pub async fn remove(&self) -> Result {
+        let path = self.0.clone();
+        Ok(tokio::task::spawn_blocking(move || remove_dir(&path)).await??)
     }
-    // Nothing from the host's git config or environment applies.
-    let alloc_limit = format!("gitoxide.objects.allocLimit={}", limits::OBJECT_BYTES);
-    let options = gix::open::Options::isolated().config_overrides([alloc_limit]);
-    Ok(gix::open_opts(path, options)?)
+
+    /// Nothing from the host's git config or environment applies.
+    pub fn open(&self) -> Result<gix::Repository> {
+        let alloc_limit = format!("gitoxide.objects.allocLimit={}", limits::OBJECT_BYTES);
+        let options = gix::open::Options::isolated().config_overrides([alloc_limit]);
+        Ok(gix::open_opts(&self.0, options)?)
+    }
+
+    /// Initialised beside the checkout and moved into place, so that it is never half a
+    /// repository.
+    fn open_or_init(&self) -> Result<gix::Repository> {
+        if !self.0.exists() {
+            let new = self.0.with_added_extension("new");
+            remove_dir(&new)?;
+            gix::init_bare(&new)?;
+            fs::rename(&new, &self.0)?;
+        }
+        self.open()
+    }
 }
 
-// 2. Fetch
+// 1. Fetch
 
 /// Writes GitHub's branches and pull request heads into the checkout, and returns them. Fails
 /// before receiving anything if they would not fit beside the refs already there.
@@ -144,61 +151,52 @@ fn fetch(
     refs.collect()
 }
 
-// 3. Set refs
+// 2. Set refs
 
 /// Makes the refs `wanted`, plus a kept head for each pull request head in it or the checkout, in
 /// one transaction.
 fn set_refs(repo: &gix::Repository, mut wanted: Refs) -> Result {
     let current = refs(repo)?;
-    let pull_heads: Vec<ObjectId> = (current.iter().chain(&wanted))
-        .filter(|(name, _)| {
-            [PULLS, PULL_HEADS]
-                .iter()
-                .any(|prefix| name.as_bstr().starts_with_str(prefix))
+    let is_pull_head = |name: &FullName| {
+        [PULLS, PULL_HEADS]
+            .iter()
+            .any(|prefix| name.as_bstr().starts_with_str(prefix))
+    };
+    let kept: Refs = (current.iter().chain(&wanted))
+        .filter(|(name, _)| is_pull_head(name))
+        .map(|(_, &oid)| {
+            let name = format!("{PULL_HEADS}{oid}").try_into();
+            (name.expect("a valid ref name"), oid)
         })
-        .map(|(_, &oid)| oid)
         .collect();
-    wanted.extend(pull_heads.into_iter().map(|oid| {
-        let name = format!("{PULL_HEADS}{oid}")
-            .try_into()
-            .expect("a valid ref name");
-        (name, oid)
-    }));
+    wanted.extend(kept);
     fits(wanted.len())?;
 
-    let deleted = (current.keys())
+    let names = (current.keys())
         .filter(|name| !wanted.contains_key(*name))
-        .map(|name| (name.clone(), None));
-    let set = (wanted.iter())
-        .filter(|(name, oid)| current.get(*name) != Some(oid))
-        .map(|(name, &oid)| (name.clone(), Some(oid)));
-    let edits = deleted.chain(set).map(|(name, oid)| {
-        let change = match oid {
-            Some(oid) => Change::Update {
-                log: LogChange::default(),
-                expected: PreviousValue::Any,
-                new: Target::Object(oid),
+        .chain(wanted.keys());
+    let edits = names
+        .filter(|name| current.get(*name) != wanted.get(*name))
+        .map(|name| RefEdit {
+            change: match wanted.get(name) {
+                Some(&oid) => Change::Update {
+                    log: LogChange::default(),
+                    expected: PreviousValue::Any,
+                    new: Target::Object(oid),
+                },
+                None => Change::Delete {
+                    expected: PreviousValue::Any,
+                    log: RefLog::AndReference,
+                },
             },
-            None => Change::Delete {
-                expected: PreviousValue::Any,
-                log: RefLog::AndReference,
-            },
-        };
-        RefEdit {
-            change,
-            name,
+            name: name.clone(),
             deref: false,
-        }
-    });
+        });
     repo.edit_references(edits)?;
     Ok(())
 }
 
 // Plumbing
-
-fn path(dir: &Path, repository: RepositoryId) -> PathBuf {
-    dir.join(format!("{}.git", repository.0))
-}
 
 fn refs(repo: &gix::Repository) -> Result<Refs> {
     let references = repo.references()?;
@@ -228,7 +226,7 @@ fn remove_dir(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::{
         collections::BTreeMap,
         future::IntoFuture,
@@ -255,41 +253,31 @@ mod tests {
     /// `gone` deleted.
     #[tokio::test]
     async fn a_replaced_pull_request_head_stays_readable() {
-        let root = std::env::temp_dir().join(format!("cv-checkout-{}", std::process::id()));
-        remove_dir(&root).unwrap();
+        let root = scratch("checkout");
         let (github, work) = (root.join("o/r.git"), root.join("work"));
         fs::create_dir_all(&github).unwrap();
-        fs::create_dir_all(&work).unwrap();
+        fs::create_dir(&work).unwrap();
         git(&github, &["init", "--bare"]);
         git(&work, &["init"]);
         git(&work, &["commit", "--allow-empty", "-m", "a"]);
         let a = git(&work, &["rev-parse", "HEAD"]);
-        let push = |refspec: &str| {
-            git(
-                &work,
-                &["push", "--force", github.to_str().unwrap(), refspec],
-            )
-        };
+        let push = |refspec| git(&work, &["push", "--force", "../o/r.git", refspec]);
         push("HEAD:refs/heads/main");
         push("HEAD:refs/heads/gone");
         push("HEAD:refs/pull/1/head");
 
         let url = format!("{}/o/r.git", serve(root.clone()).await);
-        let checkout = path(&root, REPOSITORY);
-        update(&root, REPOSITORY, url.clone(), TOKEN.into())
-            .await
-            .unwrap();
+        let checkout = Checkout::new(&root, REPOSITORY);
+        checkout.update(url.clone(), TOKEN.into()).await.unwrap();
 
         git(&work, &["commit", "--amend", "--allow-empty", "-m", "b"]);
         let b = git(&work, &["rev-parse", "HEAD"]);
         push("HEAD:refs/pull/1/head");
         push(":refs/heads/gone");
-        update(&root, REPOSITORY, url.clone(), TOKEN.into())
-            .await
-            .unwrap();
+        checkout.update(url.clone(), TOKEN.into()).await.unwrap();
 
         let refs: BTreeMap<_, _> = git(
-            &checkout,
+            &checkout.0,
             &["for-each-ref", "--format=%(refname) %(objectname)"],
         )
         .lines()
@@ -303,9 +291,9 @@ mod tests {
             (format!("refs/pull-heads/{b}"), b.clone()),
         ]);
         assert_eq!(refs, expected);
-        assert_eq!(git(&checkout, &["cat-file", "-t", &a]), "commit");
+        assert_eq!(git(&checkout.0, &["cat-file", "-t", &a]), "commit");
 
-        let config = fs::read_to_string(checkout.join("config")).unwrap();
+        let config = fs::read_to_string(checkout.0.join("config")).unwrap();
         assert!(
             !config.contains(TOKEN) && !config.contains(&url),
             "{config}"
@@ -313,11 +301,21 @@ mod tests {
         remove_dir(&root).unwrap();
     }
 
-    fn git(dir: &Path, args: &[&str]) -> String {
+    /// A new, empty directory for test `name`.
+    pub fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cv-{name}-{}", std::process::id()));
+        remove_dir(&dir).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    pub fn git(dir: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_DATE", "2020-01-01T12:00:00+05:30")
+            .env("GIT_COMMITTER_DATE", "2020-01-01T12:00:00+05:30")
             .args(["-c", "user.name=A", "-c", "user.email=a@example.com"])
             .args(args)
             .output()

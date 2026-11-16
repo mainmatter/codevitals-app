@@ -19,3 +19,6 @@ pub const REPOSITORY_KB: u32 = 10 << 20;
 pub const CHECKOUT_REFS: usize = 500_000;
 /// The largest single allocation while reading a fetched pack: an object, or a delta's result.
 pub const OBJECT_BYTES: usize = 512 << 20;
+
+/// Reachable from one set of tips. Linux has about 1.4 million.
+pub const COMMITS: usize = 2_000_000;

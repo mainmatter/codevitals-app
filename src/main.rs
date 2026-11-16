@@ -10,6 +10,11 @@
 
 mod app;
 mod checkout;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "a later step of `sync` calls it")
+)]
+mod commits;
 mod limits;
 #[cfg(test)]
 mod schema;
@@ -33,10 +38,11 @@ use axum::{
 };
 use clap::Parser;
 use octocrab::{
-    Octocrab,
+    Octocrab, Page,
     models::RepositoryId,
     secrecy::{ExposeSecret, SecretString},
 };
+use serde::de::DeserializeOwned;
 use sqlx::{
     PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
@@ -51,6 +57,28 @@ use tracing::{Level, info, info_span};
 use tracing_subscriber::EnvFilter;
 
 pub type Result<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+
+trait OctocrabExt {
+    /// Every item of the list at `path`. Fails past `limit` items.
+    async fn list<T: DeserializeOwned>(&self, path: &str, limit: usize) -> Result<Vec<T>>;
+}
+
+impl OctocrabExt for Octocrab {
+    async fn list<T: DeserializeOwned>(&self, path: &str, limit: usize) -> Result<Vec<T>> {
+        // GitHub's maximum.
+        const PER_PAGE: usize = 100;
+        let mut page: Page<T> = self.get(path, Some(&[("per_page", PER_PAGE)])).await?;
+        let mut items = Vec::new();
+        for _ in 0..limit.div_ceil(PER_PAGE) {
+            items.append(&mut page.items);
+            match self.get_page(&page.next).await? {
+                Some(next) => page = next,
+                None => return Ok(items),
+            }
+        }
+        Err(format!("more than {limit} items at {path}").into())
+    }
+}
 
 #[derive(Parser)]
 #[command(version)]
@@ -126,7 +154,6 @@ async fn main() -> Result {
     // octocrab waits forever by default, and one stalled request would stall all syncing.
     let client = || {
         let timeout = Some(limits::GITHUB_REQUEST);
-
         Octocrab::builder()
             .set_connect_timeout(timeout)
             .set_read_timeout(timeout)

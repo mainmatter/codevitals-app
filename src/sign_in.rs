@@ -1,6 +1,6 @@
 //! Signing people in with GitHub after they install the app.
 
-use std::sync::Arc;
+use std::{fmt::Display, sync::Arc};
 
 use axum::{
     extract::{Query, State},
@@ -11,12 +11,12 @@ use axum::{
     response::{IntoResponse, Redirect},
 };
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
-use octocrab::{auth::ExchangeWebFlowCodeBuilder, secrecy::ExposeSecret};
+use octocrab::{auth::ExchangeWebFlowCodeBuilder, models::Installation, secrecy::ExposeSecret};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-use crate::App;
+use crate::{App, OctocrabExt, limits};
 
 /// `__Host-`: set by this origin only, over HTTPS only.
 const VERIFIER_COOKIE: &str = "__Host-pkce";
@@ -88,20 +88,17 @@ pub async fn callback(
     .code_verifier(verifier)
     .send()
     .await
-    .map_err(github_failed)?;
+    .map_err(failed)?;
 
     // Acts as the person who signed in. Store `token.access_token` to keep acting for them.
     let user = app
         .github
         .user_access_token(token.access_token)
-        .map_err(github_failed)?;
-    let installations = user
-        .current()
-        .list_app_installations_accessible_to_user()
-        .per_page(100)
-        .send()
+        .map_err(failed)?;
+    let installations: Vec<Installation> = user
+        .list("/user/installations", limits::INSTALLATIONS)
         .await
-        .map_err(github_failed)?;
+        .map_err(failed)?;
 
     let accounts: Vec<_> = installations.into_iter().map(|i| i.account.login).collect();
     info!(?accounts, "signed in");
@@ -110,7 +107,7 @@ pub async fn callback(
     ))
 }
 
-fn github_failed(error: octocrab::Error) -> StatusCode {
-    warn!(%error, "GitHub request failed");
+fn failed(error: impl Display) -> StatusCode {
+    warn!(%error, "sign-in failed");
     StatusCode::BAD_GATEWAY
 }
