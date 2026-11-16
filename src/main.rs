@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod checkout;
 mod limits;
 #[cfg(test)]
 mod schema;
@@ -20,6 +21,7 @@ use std::{
     error::Error,
     future::IntoFuture,
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -48,6 +50,8 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::{Level, info, info_span};
 use tracing_subscriber::EnvFilter;
 
+pub type Result<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+
 #[derive(Parser)]
 #[command(version)]
 struct Config {
@@ -57,6 +61,9 @@ struct Config {
     /// Postgres, e.g. `postgres:///cv?host=/run/postgresql`.
     #[arg(long = "database-url", value_name = "URL")]
     database: PgConnectOptions,
+    /// Directory for a bare git checkout of each repository. Made readable by this user only.
+    #[arg(long = "checkout-dir", value_name = "DIR")]
+    checkouts: PathBuf,
 
     /// The app's ID.
     #[arg(long)]
@@ -109,11 +116,12 @@ impl App {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let config = Config::parse();
+    checkout::prepare(&config.checkouts)?;
 
     // octocrab waits forever by default, and one stalled request would stall all syncing.
     let client = || {

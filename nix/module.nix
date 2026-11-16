@@ -81,6 +81,7 @@ in
           (lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.default)
           "--listen=${cfg.listen}"
           "--database-url=postgres:///cv?host=/run/postgresql&user=cv"
+          "--checkout-dir=%S/cv"
           "--app-id=${toString cfg.appId}"
           "--client-id=${cfg.clientId}"
           "--private-key-file=%d/private-key"
@@ -94,6 +95,7 @@ in
           "webhook-secret:${cfg.webhookSecretFile}"
         ];
         DynamicUser = true;
+        StateDirectory = "cv";
         Restart = "on-failure";
 
         CapabilityBoundingSet = "";

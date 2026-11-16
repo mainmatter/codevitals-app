@@ -58,7 +58,11 @@
               ];
             };
             strictDeps = true;
-            nativeCheckInputs = [ pkgs.postgresql_18 ];
+            # Git serves the checkout tests' fixture repository.
+            nativeCheckInputs = [
+              pkgs.git
+              pkgs.postgresql_18
+            ];
             # A Postgres of the build's own, reachable only through a socket, as `#[sqlx::test]`
             # expects.
             preCheck = ''
@@ -83,6 +87,7 @@
             name = "cv-ci";
             packages = [
               rustToolchain
+              pkgs.git
               pkgs.postgresql_18
             ];
           };

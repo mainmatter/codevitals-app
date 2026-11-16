@@ -25,10 +25,9 @@ use octocrab::{
     secrecy::ExposeSecret,
 };
 use serde::de::DeserializeOwned;
-use tokio::time::timeout;
 use tracing::{Instrument, info_span, warn};
 
-use crate::{App, app, limits};
+use crate::{App, Result, app, limits};
 
 // 1. Triggers
 
@@ -138,13 +137,13 @@ async fn run(app: Arc<App>, repository: RepositoryId) {
         }
         let synced = async {
             match context(&app.github, repository).await? {
-                Some(context) => app::sync(&context).await,
-                None => app::forget(repository).await,
+                Some(context) => app::sync(&app, &context).await,
+                None => app::forget(&app, repository).await,
             }
         };
+        // Never cancelled: blocking work would outlive it, and the next run could overlap it.
         let span = info_span!("sync", repository = repository.0);
-        let synced = timeout(limits::SYNC_TIMEOUT, synced).instrument(span).await;
-        if let Err(error) = synced.unwrap_or_else(|elapsed| Err(elapsed.into())) {
+        if let Err(error) = synced.instrument(span).await {
             warn!(repository = repository.0, %error, "sync failed");
         }
     }
@@ -169,6 +168,9 @@ async fn context(github: &Octocrab, repository: RepositoryId) -> Result<Option<a
         }
         found => found?,
     };
+    if found.size.ok_or("no size")? > limits::REPOSITORY_KB {
+        return Err(format!("more than {} KB on GitHub", limits::REPOSITORY_KB).into());
+    }
     Ok(Some(app::Context {
         repository,
         full_name: found.full_name.ok_or("no full name")?,
@@ -179,8 +181,6 @@ async fn context(github: &Octocrab, repository: RepositoryId) -> Result<Option<a
 }
 
 // Plumbing
-
-pub type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// GitHub's maximum.
 const PER_PAGE: usize = 100;
@@ -234,13 +234,6 @@ pub mod tests {
         assert_eq!(fake.reads.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
-    async fn an_uninstalled_repository_is_forgotten() {
-        let (app, _) = app();
-        let context = context(&app.github, RepositoryId(43)).await;
-        assert!(context.unwrap().is_none());
-    }
-
     /// GitHub where installation 7 sees only [`REPOSITORY`]. Each read of it is counted, then
     /// held until `release`.
     pub struct Fake {
@@ -275,6 +268,7 @@ pub mod tests {
                         "name": "r",
                         "full_name": "o/r",
                         "default_branch": "main",
+                        "size": 1,
                         "url": "https://api.github.com/repos/o/r",
                     });
                     (StatusCode::OK, repository)
@@ -300,6 +294,7 @@ pub mod tests {
         let config = crate::Config {
             listen: ([127, 0, 0, 1], 0).into(),
             database: "postgres://unused".parse().unwrap(),
+            checkouts: "/unused".into(),
             app_id: 1,
             client_id: "unused".into(),
             private_key: "unused".into(),

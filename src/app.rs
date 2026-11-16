@@ -3,10 +3,10 @@
 use octocrab::{Octocrab, models::RepositoryId, secrecy::SecretString};
 use tracing::info;
 
-use crate::sync::Result;
+use crate::{App, Result, checkout};
 
 /// Read from GitHub at the start of each sync.
-#[expect(dead_code, reason = "the `sync` stub reads only the description")]
+#[expect(dead_code, reason = "later steps read the rest")]
 pub struct Context {
     pub repository: RepositoryId,
     pub full_name: String,
@@ -18,17 +18,16 @@ pub struct Context {
 }
 
 /// Must be idempotent. Never runs twice at once for one repository.
-pub async fn sync(context: &Context) -> Result {
-    info!(
-        repository = context.repository.0,
-        full_name = context.full_name,
-        default_branch = context.default_branch,
-        "synced"
-    );
+pub async fn sync(app: &App, context: &Context) -> Result {
+    let url = format!("https://github.com/{}.git", context.full_name);
+    let token = context.token.clone();
+    checkout::update(&app.config.checkouts, context.repository, url, token).await?;
+    info!(repository = context.repository.0, "synced");
     Ok(())
 }
 
-pub async fn forget(repository: RepositoryId) -> Result {
+pub async fn forget(app: &App, repository: RepositoryId) -> Result {
+    checkout::remove(&app.config.checkouts, repository).await?;
     info!(repository = repository.0, "forgot");
     Ok(())
 }
