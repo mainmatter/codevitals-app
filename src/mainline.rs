@@ -17,7 +17,7 @@ use sqlx::PgPool;
 use crate::{
     Result,
     changes::{self, CommitPair},
-    limits,
+    column, limits,
     mirror::Mirror,
 };
 
@@ -58,26 +58,21 @@ pub async fn record(
 /// From the root to `tip`, each commit paired with its first parent.
 fn first_parents(repo: &gix::Repository, tip: ObjectId) -> Result<Vec<CommitPair>> {
     let walk = repo.rev_walk([tip]).first_parent_only().all()?;
-    let mut line = Vec::new();
-    for commit in walk.take(limits::COMMITS + 1) {
+    let pairs = walk.map(|commit| {
         let commit = commit?;
         let base = commit.parent_ids.first().copied();
-        line.push(CommitPair {
+        Ok(CommitPair {
             base,
             head: commit.id,
-        });
-    }
-    if line.len() > limits::COMMITS {
-        let max = limits::COMMITS;
-        return Err(format!("more than {max} commits on a first-parent line").into());
-    }
+        })
+    });
+    let mut line = limits::collect(pairs, limits::COMMITS, "commits on a first-parent line")?;
     line.reverse();
     Ok(line)
 }
 
 /// One transaction.
 async fn replace(db: &PgPool, repository: i64, branch: &str, line: &[CommitPair]) -> Result {
-    let commits: Vec<&[u8]> = line.iter().map(|pair| pair.head.as_slice()).collect();
     let mut transaction = db.begin().await?;
     sqlx::query("DELETE FROM mainline WHERE repo = $1 AND branch = $2")
         .bind(repository)
@@ -90,7 +85,7 @@ async fn replace(db: &PgPool, repository: i64, branch: &str, line: &[CommitPair]
     )
     .bind(repository)
     .bind(branch)
-    .bind(&commits)
+    .bind(column(line, |pair| pair.head.as_slice()))
     .execute(&mut *transaction)
     .await?;
     Ok(transaction.commit().await?)

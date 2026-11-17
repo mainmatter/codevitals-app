@@ -17,34 +17,28 @@ use crate::{Result, column, limits, mirror::Mirror};
 
 pub async fn record(db: &PgPool, mirror: &Mirror, tips: Vec<ObjectId>) -> Result<Vec<ObjectId>> {
     let reachable = mirror.run(move |repo| reachable(repo, tips)).await?;
-    for batch in missing(db, &reachable).await?.chunks(limits::BATCH) {
-        for commit in mirror.run_each(batch.to_vec(), read_commit).await? {
-            insert(db, &commit).await?;
-        }
-    }
+    let missing = missing(db, &reachable).await?;
+    mirror
+        .read_each(&missing, read_commit, |commit| insert(db, commit))
+        .await?;
     Ok(reachable)
 }
 
 // 1. Reachable
 
 fn reachable(repo: &gix::Repository, tips: Vec<ObjectId>) -> Result<Vec<ObjectId>> {
-    let walk = repo.rev_walk(tips).all()?.take(limits::COMMITS + 1);
-    let commits = walk.map(|info| Ok(info?.id)).collect::<Result<Vec<_>>>()?;
-    if commits.len() > limits::COMMITS {
-        return Err(format!("more than {} reachable commits", limits::COMMITS).into());
-    }
-    Ok(commits)
+    let walk = repo.rev_walk(tips).all()?.map(|info| Ok(info?.id));
+    limits::collect(walk, limits::COMMITS, "reachable commits")
 }
 
 // 2. Missing
 
 async fn missing(db: &PgPool, commits: &[ObjectId]) -> Result<Vec<ObjectId>> {
-    let shas: Vec<&[u8]> = commits.iter().map(|sha| sha.as_slice()).collect();
     let missing: Vec<Vec<u8>> = sqlx::query_scalar(
         "SELECT c.sha FROM unnest($1::bytea[]) AS c (sha)
          WHERE NOT EXISTS (SELECT FROM commit WHERE commit.sha = c.sha)",
     )
-    .bind(&shas)
+    .bind(column(commits, |sha| sha.as_slice()))
     .fetch_all(db)
     .await?;
     Ok(missing
@@ -127,7 +121,7 @@ fn name_and_email(value: &BStr) -> Option<(&BStr, &BStr)> {
 }
 
 /// One statement, so a commit and its people go in together.
-async fn insert(db: &PgPool, commit: &Commit) -> Result {
+async fn insert(db: &PgPool, commit: Commit) -> Result {
     let people = &commit.people;
     sqlx::query(
         "WITH commit AS (

@@ -14,7 +14,7 @@ use gix::{
     bstr::{BStr, BString, ByteSlice, ByteVec},
     diff::{
         blob::{Algorithm, Diff, InternedInput},
-        tree::{Error, State, Visit, visit},
+        tree::{State, Visit, visit},
     },
     object::tree::{EntryKind, EntryMode},
     objs::TreeRefIter,
@@ -32,31 +32,24 @@ pub struct CommitPair {
 
 /// The commits of `pairs` must have rows.
 pub async fn record(db: &PgPool, mirror: &Mirror, pairs: &[CommitPair]) -> Result {
-    for batch in missing(db, pairs).await?.chunks(limits::BATCH) {
-        for changes in mirror.run_each(batch.to_vec(), diff_pair).await? {
-            insert(db, &changes).await?;
-        }
-    }
-    Ok(())
+    let missing = missing(db, pairs).await?;
+    mirror
+        .read_each(&missing, diff_pair, |changes| insert(db, changes))
+        .await
 }
 
 // 1. Missing
 
 /// A pair whose trees are equal has no rows, so it is always missing.
 async fn missing(db: &PgPool, pairs: &[CommitPair]) -> Result<Vec<CommitPair>> {
-    let bases: Vec<_> = pairs
-        .iter()
-        .map(|pair| pair.base.as_ref().map(ObjectId::as_slice))
-        .collect();
-    let heads: Vec<_> = pairs.iter().map(|pair| pair.head.as_slice()).collect();
     let missing: Vec<(Option<Vec<u8>>, Vec<u8>)> = sqlx::query_as(
         "SELECT p.base, p.head FROM unnest($1::bytea[], $2::bytea[]) AS p (base, head)
          WHERE NOT EXISTS (
              SELECT FROM change c WHERE c.head = p.head AND c.base IS NOT DISTINCT FROM p.base
          )",
     )
-    .bind(&bases)
-    .bind(&heads)
+    .bind(column(pairs, |p| p.base.as_ref().map(ObjectId::as_slice)))
+    .bind(column(pairs, |pair| pair.head.as_slice()))
     .fetch_all(db)
     .await?;
     let pair = |(base, head): (Option<Vec<u8>>, Vec<u8>)| CommitPair {
@@ -106,10 +99,12 @@ fn diff_pair(repo: &gix::Repository, pair: CommitPair) -> Result<PairChanges> {
         &repo.objects,
         &mut changed,
     );
-    if let Err(Error::Cancelled) = diffed {
-        let max = limits::CHANGED_PATH_BYTES;
-        return Err(format!("more than {max} bytes of changed paths between two commits").into());
-    }
+    // `ChangedFiles` cancels the diff past the bound.
+    limits::check(
+        changed.path_bytes,
+        limits::CHANGED_PATH_BYTES,
+        "changed path bytes",
+    )?;
     diffed?;
 
     let mut files = Vec::new();
@@ -235,7 +230,7 @@ pub fn is_binary(content: &[u8]) -> bool {
 
 // 3. Insert
 
-async fn insert(db: &PgPool, changes: &PairChanges) -> Result {
+async fn insert(db: &PgPool, changes: PairChanges) -> Result {
     let files = &changes.files;
     let oid = |entry: Option<Entry>| entry.map(|entry| entry.oid.as_slice().to_vec());
     let mode = |entry: Option<Entry>| entry.map(|entry| entry.mode);

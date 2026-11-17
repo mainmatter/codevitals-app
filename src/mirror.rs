@@ -3,7 +3,7 @@
 //! 1. [`Mirror::update`] [`fetch`]es GitHub's branches and pull request heads.
 //! 2. [`prune`] deletes those GitHub no longer has, and keeps every pull request head as
 //!    `refs/pull-heads/<oid>`, so a head replaced by a force-push stays readable.
-//! 3. [`Mirror::run`] and [`Mirror::run_each`] read the mirror on rayon's thread pool, keeping
+//! 3. [`Mirror::run`] and [`Mirror::read_each`] read the mirror on rayon's thread pool, keeping
 //!    CPU-bound work off the async runtime.
 //!
 //! The token reaches git only through the credentials callback, never a URL or the config.
@@ -103,22 +103,35 @@ impl Mirror {
         receive.await?
     }
 
-    /// In parallel, in order.
-    pub async fn run_each<I: Send + 'static, T: Send + 'static>(
+    /// The shape of every step: `read` each item, a batch at a time in parallel, and hand what it
+    /// read to `insert`, in order.
+    pub async fn read_each<I, T, F>(
         &self,
-        items: Vec<I>,
-        job: impl Fn(&gix::Repository, I) -> Result<T> + Send + Sync + 'static,
-    ) -> Result<Vec<T>> {
-        self.run(move |repo| {
-            let (repo, span) = (repo.clone().into_sync(), Span::current());
-            (items.into_par_iter())
-                .map_init(
-                    || repo.to_thread_local(),
-                    |repo, item| span.in_scope(|| job(repo, item)),
-                )
-                .collect()
-        })
-        .await
+        items: &[I],
+        read: fn(&gix::Repository, I) -> Result<T>,
+        mut insert: impl FnMut(T) -> F,
+    ) -> Result
+    where
+        I: Clone + Send + 'static,
+        T: Send + 'static,
+        F: Future<Output = Result>,
+    {
+        for batch in items.chunks(limits::BATCH) {
+            let batch = batch.to_vec();
+            let read = self.run(move |repo| {
+                let (repo, span) = (repo.clone().into_sync(), Span::current());
+                (batch.into_par_iter())
+                    .map_init(
+                        || repo.to_thread_local(),
+                        |repo, item| span.in_scope(|| read(repo, item)),
+                    )
+                    .collect::<Result<Vec<_>>>()
+            });
+            for item in read.await? {
+                insert(item).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Nothing from the host's git config or environment applies.
@@ -169,7 +182,8 @@ fn fetch(
     let prepared = (remote.connect(Direction::Fetch)?)
         .with_credentials(credentials)
         .prepare_fetch(Discard, Default::default())?;
-    check_ref_count(prepared.ref_map().mappings.len() + read_refs(repo)?.len())?;
+    let refs = prepared.ref_map().mappings.len() + read_refs(repo)?.len();
+    limits::check(refs, limits::MIRROR_REFS, REFS)?;
     let fetched = prepared.receive(Discard, interrupt)?;
 
     let github = fetched.ref_map.mappings.into_iter().map(|mapping| {
@@ -197,7 +211,7 @@ fn prune(repo: &gix::Repository, github: &Refs) -> Result {
             wanted.insert(kept, oid);
         }
     }
-    check_ref_count(wanted.len())?;
+    limits::check(wanted.len(), limits::MIRROR_REFS, REFS)?;
 
     let deleted = (refs.keys().filter(|name| !wanted.contains_key(*name))).map(|name| RefEdit {
         change: Change::Delete {
@@ -221,23 +235,22 @@ fn prune(repo: &gix::Repository, github: &Refs) -> Result {
     Ok(())
 }
 
-fn read_refs(repo: &gix::Repository) -> Result<Refs> {
-    let mut refs = Refs::new();
-    for reference in repo.references()?.all()?.take(limits::MIRROR_REFS + 1) {
-        let reference = reference?.detach();
-        // Only direct refs are written here.
-        refs.insert(reference.name, reference.target.into_id());
-    }
-    check_ref_count(refs.len())?;
-    Ok(refs)
-}
+/// Checked before every write too, so a mirror never holds more refs than it can read.
+const REFS: &str = "refs in a mirror";
 
-/// Checked before every write, so a mirror never holds more refs than it can read.
-fn check_ref_count(refs: usize) -> Result {
-    if refs > limits::MIRROR_REFS {
-        return Err(format!("more than {} refs in a mirror", limits::MIRROR_REFS).into());
-    }
-    Ok(())
+fn read_refs(repo: &gix::Repository) -> Result<Refs> {
+    let platform = repo.references()?;
+    let refs = platform
+        .all()?
+        .take(limits::MIRROR_REFS + 1)
+        .map(|reference| {
+            let reference = reference?.detach();
+            // Only direct refs are written here.
+            Ok((reference.name, reference.target.into_id()))
+        });
+    let refs = refs.collect::<Result<Refs>>()?;
+    limits::check(refs.len(), limits::MIRROR_REFS, REFS)?;
+    Ok(refs)
 }
 
 fn remove_dir(path: &Path) -> io::Result<()> {

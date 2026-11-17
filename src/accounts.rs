@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::PgPool;
 
-use crate::{Result, limits};
+use crate::{Result, column, limits};
 
 /// `commits` must be in the repository `full_name`.
 pub async fn record(
@@ -39,7 +39,6 @@ pub async fn record(
 
 /// Lowercased emails.
 async fn unasked(db: &PgPool, commits: &[ObjectId]) -> Result<Vec<(String, ObjectId)>> {
-    let shas: Vec<&[u8]> = commits.iter().map(|sha| sha.as_slice()).collect();
     let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
         "SELECT DISTINCT ON (lower(p.email)) lower(p.email), p.commit
          FROM unnest($1::bytea[]) AS r (sha)
@@ -47,7 +46,7 @@ async fn unasked(db: &PgPool, commits: &[ObjectId]) -> Result<Vec<(String, Objec
          WHERE p.role IN ('author', 'committer', 'co-authored-by')
              AND NOT EXISTS (SELECT FROM email_account a WHERE a.email = lower(p.email))",
     )
-    .bind(&shas)
+    .bind(column(commits, |sha| sha.as_slice()))
     .fetch_all(db)
     .await?;
     let unasked = rows
@@ -124,9 +123,7 @@ async fn ask(
     }
     let mut accounts = HashMap::new();
     for commit in data.repository.into_values() {
-        if commit.authors.total > max {
-            return Err(format!("more than {max} authors on a commit").into());
-        }
+        limits::check(commit.authors.total, max, "authors on a commit")?;
         for actor in commit.authors.nodes.into_iter().chain([commit.committer]) {
             if let Some(email) = actor.email {
                 let account = accounts.entry(email.to_lowercase()).or_insert(None);

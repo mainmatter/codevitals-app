@@ -23,6 +23,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tree-sitter = "=0.27.0"
 tree-sitter-c = "=0.24.2"
 tree-sitter-cpp = "=0.23.4"
+tree-sitter-python = "=0.25.0"
 tree-sitter-rust = "=0.24.2"
 
 # Crash by default: a panic anywhere, in any task, ends the process.
@@ -40,6 +41,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.tree-sitter-cpp]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-python]
 opt-level = 3
 
 [profile.dev.package.tree-sitter-rust]

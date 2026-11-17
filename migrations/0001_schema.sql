@@ -136,10 +136,15 @@ LEFT JOIN email_account a ON a.email = lower(p.email);
 -- # Facts
 
 -- The language a path's content is read as; null where no extractor applies. Analyses join
--- `change` to `blob_fact` through it.
+-- `change` to `blob_fact` through it. A `.h` header is read as C++.
 CREATE FUNCTION language(path text, mode mode) RETURNS text
 LANGUAGE sql IMMUTABLE STRICT
-RETURN CASE WHEN mode IN ('file', 'executable') AND path LIKE '%.rs' THEN 'rust' END;
+RETURN CASE WHEN mode IN ('file', 'executable') THEN CASE
+    WHEN path ~ '\.rs$' THEN 'rust'
+    WHEN path ~ '\.c$' THEN 'c'
+    WHEN path ~ '\.(h|C|H|cc|hh|cpp|hpp|cxx|hxx|c\+\+|h\+\+)$' THEN 'cpp'
+    WHEN path ~ '\.pyi?$' THEN 'python'
+END END;
 
 -- What version `extractor` found in a blob read as `language`; a later version replaces the row.
 -- `status` is the first that applies:

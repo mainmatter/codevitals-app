@@ -5,7 +5,8 @@
 //! - functions and scopes: nodes of the language's kinds with a body. A function's name, and a
 //!   scope's, qualifies the names inside it: `outer::inner`. An unnamed function is numbered within
 //!   its enclosing name, `run::{closure#0}`; an unnamed scope qualifies nothing.
-//! - tokens: leaves, a literal one leaf, comments and empty leaves excluded.
+//! - tokens: leaves, a literal one leaf, comments and empty leaves excluded. Inside a literal only
+//!   errors count, and depth, so code in a Python f-string is checked but not counted.
 //! - A function's counts leave out the functions inside it, which have their own.
 //! - maximum nesting: of the language's nesting kinds, from the function down. An `else if` is a
 //!   sibling and does not add nesting.
@@ -105,7 +106,7 @@ pub fn parse(source: &[u8], language: &Language) -> Result<CodeFacts, &'static s
             let depth = ancestors.len();
             let parent = ancestors.last_mut().expect("the root has a parent entry");
             let enclosing = walk.visit(node, parent, depth);
-            if !is_literal(node) && cursor.goto_first_child() {
+            if cursor.goto_first_child() {
                 if ancestors.len() > limits::SYNTAX_DEPTH {
                     return Err("too_deep");
                 }
@@ -126,9 +127,10 @@ pub fn parse(source: &[u8], language: &Language) -> Result<CodeFacts, &'static s
     Ok(walk.code)
 }
 
-/// Walked as one token: what is inside it is its value.
+/// Counted as one token: what is inside it is its value. The C and Rust grammars name literals
+/// `…_literal`; tree-sitter-python's one literal with children is `string`.
 fn is_literal(node: Node) -> bool {
-    node.kind().ends_with("_literal")
+    node.kind().ends_with("_literal") || node.kind() == "string"
 }
 
 struct Walk<'l, 's> {
@@ -159,6 +161,7 @@ struct Enclosing<'t> {
     test: bool,
     /// The kind of the child that marks its next sibling as test code.
     test_next: Option<&'t str>,
+    literal: bool,
 }
 
 impl Walk<'_, '_> {
@@ -169,6 +172,14 @@ impl Walk<'_, '_> {
         parent: &mut Enclosing<'t>,
         depth: usize,
     ) -> Enclosing<'t> {
+        let error = i32::from(node.is_error() || node.is_missing());
+        self.code.errors += error;
+        if parent.literal {
+            if let Some(index) = parent.function {
+                self.code.functions[index].errors += error;
+            }
+            return *parent;
+        }
         let language = self.language;
         let kind = node.kind();
         let mark = (language.test)(&self.source, node);
@@ -185,6 +196,7 @@ impl Walk<'_, '_> {
             kind,
             test: parent.test || marked_by_sibling || mark == Some(Test::Itself),
             test_next: None,
+            literal: is_literal(node),
             ..*parent
         };
 
@@ -215,11 +227,9 @@ impl Walk<'_, '_> {
             enclosing.scope = self.push_scope(enclosing.scope, &name);
         }
 
-        let leaf = node.child_count() == 0 || is_literal(node);
+        let leaf = node.child_count() == 0 || enclosing.literal;
         let token = i32::from(leaf && !node.byte_range().is_empty());
-        let error = i32::from(node.is_error() || node.is_missing());
         self.code.tokens += token;
-        self.code.errors += error;
         let Some(index) = enclosing.function else {
             return enclosing;
         };

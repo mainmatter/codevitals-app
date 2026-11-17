@@ -2,6 +2,27 @@
 
 use std::time::Duration;
 
+use crate::Result;
+
+/// An error if there are more than `max` of `what`.
+pub fn check(count: usize, max: usize, what: &str) -> Result {
+    if count > max {
+        return Err(format!("more than {max} {what}").into());
+    }
+    Ok(())
+}
+
+/// Reads one past `max`, to tell whether there are more.
+pub fn collect<T>(
+    items: impl Iterator<Item = Result<T>>,
+    max: usize,
+    what: &str,
+) -> Result<Vec<T>> {
+    let items = items.take(max + 1).collect::<Result<Vec<_>>>()?;
+    check(items.len(), max, what)?;
+    Ok(items)
+}
+
 /// GitHub sends up to 25 MB.
 pub const WEBHOOK_BODY: usize = 25 << 20;
 pub const GITHUB_REQUEST: Duration = Duration::from_secs(30);

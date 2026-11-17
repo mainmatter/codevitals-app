@@ -9,6 +9,7 @@
 //! alone decides the facts.
 
 mod c;
+mod python;
 mod rust;
 mod syntax;
 
@@ -25,12 +26,10 @@ use crate::{Result, changes, column, limits, mirror::Mirror};
 pub const EXTRACTOR: i32 = 3;
 
 pub async fn record(db: &PgPool, mirror: &Mirror, repository: RepositoryId) -> Result {
-    for batch in missing(db, repository).await?.chunks(limits::BATCH) {
-        for facts in mirror.run_each(batch.to_vec(), extract).await? {
-            replace(db, &facts).await?;
-        }
-    }
-    Ok(())
+    let missing = missing(db, repository).await?;
+    mirror
+        .read_each(&missing, extract, |facts| replace(db, facts))
+        .await
 }
 
 // 1. Missing
@@ -55,9 +54,7 @@ async fn missing(db: &PgPool, repository: RepositoryId) -> Result<Vec<(ObjectId,
     .bind(limits::BLOBS as i64 + 1)
     .fetch_all(db)
     .await?;
-    if missing.len() > limits::BLOBS {
-        return Err(format!("more than {} blobs without facts", limits::BLOBS).into());
-    }
+    limits::check(missing.len(), limits::BLOBS, "blobs without facts")?;
     let blob = |(oid, language): (Vec<u8>, _)| (ObjectId::from_bytes_or_panic(&oid), language);
     Ok(missing.into_iter().map(blob).collect())
 }
@@ -68,15 +65,15 @@ async fn missing(db: &PgPool, repository: RepositoryId) -> Result<Vec<(ObjectId,
 struct BlobFacts {
     blob: ObjectId,
     language: Option<String>,
-    status: &'static str,
     bytes: i64,
     lines: Option<i32>,
-    code: Option<CodeFacts>,
+    /// Or the status saying why there are none.
+    code: std::result::Result<CodeFacts, &'static str>,
 }
 
 const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/";
 
-/// The first status in `blob_fact.status` that applies, and the facts it allows.
+/// Facts as far as the first status in `blob_fact.status` that applies allows.
 #[instrument(level = "debug", skip_all, fields(%blob))]
 fn extract(
     repo: &gix::Repository,
@@ -87,10 +84,9 @@ fn extract(
     let unread = |status| BlobFacts {
         blob,
         language: language.clone(),
-        status,
         bytes,
         lines: None,
-        code: None,
+        code: Err(status),
     };
     if size > limits::FACT_BYTES {
         return Ok(unread("too_large"));
@@ -104,22 +100,18 @@ fn extract(
     }
     let lines = content.split_inclusive(|&byte| byte == b'\n').count();
     let lines = Some(lines.try_into()?);
-    let parsed = match language.as_deref() {
+    let code = match language.as_deref() {
         _ if is_generated(&content) => Err("generated"),
         None => Err("unsupported"),
         Some("rust") => syntax::parse(&content, &rust::RUST),
         Some("c") => syntax::parse(&content, &c::C),
         Some("cpp") => syntax::parse(&content, &c::CPP),
+        Some("python") => syntax::parse(&content, &python::PYTHON),
         Some(language) => return Err(format!("no extractor for {language}").into()),
-    };
-    let (status, code) = match parsed {
-        Ok(code) => ("parsed", Some(code)),
-        Err(status) => (status, None),
     };
     Ok(BlobFacts {
         blob,
         language,
-        status,
         bytes,
         lines,
         code,
@@ -149,9 +141,12 @@ fn is_generated(content: &[u8]) -> bool {
 
 /// Inserting the blob's row and its functions in one statement means a sync that loses a race to
 /// insert the same row adds no functions either.
-async fn replace(db: &PgPool, facts: &BlobFacts) -> Result {
+async fn replace(db: &PgPool, facts: BlobFacts) -> Result {
     let (blob, language) = (facts.blob.as_slice(), facts.language.as_deref());
-    let code = facts.code.as_ref();
+    let (status, code) = match &facts.code {
+        Ok(code) => ("parsed", Some(code)),
+        Err(status) => (*status, None),
+    };
     let functions = code.map_or(&[][..], |code| &code.functions);
     let mut transaction = db.begin().await?;
     sqlx::query("DELETE FROM blob_fact WHERE blob = $1 AND language IS NOT DISTINCT FROM $2")
@@ -174,7 +169,7 @@ async fn replace(db: &PgPool, facts: &BlobFacts) -> Result {
     .bind(blob)
     .bind(language)
     .bind(EXTRACTOR)
-    .bind(facts.status)
+    .bind(status)
     .bind(facts.bytes)
     .bind(facts.lines)
     .bind(code.map(|code| code.tokens))
@@ -228,6 +223,7 @@ mod tests {
             ("a.c", include_str!("facts/c/golden.c")),
             ("a.h", include_str!("facts/c/golden.h")),
             ("a.cpp", include_str!("facts/c/golden.cpp")),
+            ("a.py", include_str!("facts/python/golden.py")),
             ("binary.rs", "fn\0\n"),
             (
                 "broken.rs",
@@ -267,6 +263,7 @@ mod tests {
                 "a.c c parsed 1541 85 366 0 11",
                 "a.cpp cpp parsed 1442 75 392 0 13",
                 "a.h cpp parsed 515 29 117 0 2",
+                "a.py python parsed 2513 130 558 0 29",
                 "a.rs rust parsed 2010 104 569 0 18",
                 "a.txt unsupported 2010 104 0",
                 "binary.rs rust binary 4 0",
