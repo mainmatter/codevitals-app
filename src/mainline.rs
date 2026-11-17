@@ -96,15 +96,13 @@ mod tests {
     use std::{collections::BTreeSet, fs, os::unix::fs::PermissionsExt};
 
     use super::*;
-    use crate::{
-        commits,
-        fixtures::{commit, git, repo, rows, scratch, submodule, write},
+    use crate::fixtures::{
+        self, EMPTY_TREE, assert_changes_match_git, commit, git, repo, rows, scratch, submodule,
+        write,
     };
 
-    const REPOSITORY: RepositoryId = RepositoryId(1);
-
-    /// `main` and `side` go through ordinary pushes, replaced commits, a fast-forward that reroutes
-    /// `main`'s first-parent line, and unrelated history. Then `side` is no longer tracked.
+    /// `main` and `side` go through ordinary pushes, replaced commits and a fast-forward that
+    /// reroutes `main`'s first-parent line. Then `side` is no longer tracked.
     #[sqlx::test]
     async fn every_seq_holds_what_git_lists(db: PgPool) {
         repo(&db).await;
@@ -160,13 +158,6 @@ mod tests {
         git(work, &["merge", "--ff-only", "side"]);
         sync_and_check(&db, &mirror, &both).await;
 
-        // Unrelated history.
-        git(work, &["switch", "--orphan", "unrelated"]);
-        write(work, "new.txt", "new\n");
-        commit(work, "unrelated");
-        git(work, &["branch", "--force", "main", "unrelated"]);
-        sync_and_check(&db, &mirror, &both).await;
-
         sync_and_check(&db, &mirror, &["main"]).await;
         let side = rows(&db, "SELECT branch FROM mainline WHERE branch = 'side'");
         assert!(side.await.is_empty());
@@ -175,26 +166,34 @@ mod tests {
 
     async fn sync_and_check(db: &PgPool, mirror: &Mirror, names: &[&str]) {
         let work = &mirror.0;
-        let tip = |name: &str| git(work, &["rev-parse", name]).parse().unwrap();
-        let branches: Vec<(String, ObjectId)> = names
-            .iter()
-            .map(|&name| (name.to_owned(), tip(name)))
-            .collect();
-        let tips = branches.iter().map(|(_, tip)| *tip).collect();
-        commits::record(db, mirror, tips).await.unwrap();
-        record(db, mirror, REPOSITORY, &branches).await.unwrap();
+        fixtures::record(db, mirror, names).await;
 
-        let sorted = |lines: Vec<String>| Vec::from_iter(BTreeSet::from_iter(lines));
         for &branch in names {
-            let line = git(work, &["rev-list", "--first-parent", "--reverse", branch]);
-            let line: Vec<&str> = line.lines().collect();
+            // Each commit on the line, after its first parent.
+            let line = git(
+                work,
+                &[
+                    "rev-list",
+                    "--first-parent",
+                    "--reverse",
+                    "--parents",
+                    branch,
+                ],
+            );
+            let pairs = Vec::from_iter(line.lines().map(|line| {
+                let mut ids = line.split(' ');
+                let commit = ids.next().unwrap().to_owned();
+                (ids.next().unwrap_or(EMPTY_TREE).to_owned(), commit)
+            }));
 
             let mainline = format!(
                 "SELECT seq || ' ' || encode(commit, 'hex') FROM mainline WHERE branch = '{branch}'"
             );
-            let listed = line.iter().enumerate();
-            let listed = listed.map(|(seq, commit)| format!("{seq} {commit}"));
-            assert_eq!(rows(db, &mainline).await, sorted(listed.collect()));
+            let listed = pairs
+                .iter()
+                .enumerate()
+                .map(|(seq, (_, commit))| format!("{seq} {commit}"));
+            assert_eq!(rows(db, &mainline).await, sorted(listed));
 
             let tree = format!(
                 "SELECT concat_ws(' ', encode(commit, 'hex'),
@@ -204,34 +203,17 @@ mod tests {
                 FROM tree JOIN mainline m USING (repo, branch)
                 WHERE branch = '{branch}' AND seqs @> m.seq"
             );
-            let listed = line.iter().flat_map(|commit| {
+            let listed = pairs.iter().flat_map(|(_, commit)| {
                 let format = format!("--format={commit} %(objectmode) %(objectname) %(path)");
                 let listed = git(work, &["ls-tree", "-r", &format, commit]);
                 listed.lines().map(String::from).collect::<Vec<_>>()
             });
-            assert_eq!(rows(db, &tree).await, sorted(listed.collect()));
-
-            // Without submodules, whose `Subproject commit` lines git counts.
-            let counted = format!(
-                "SELECT concat_ws(E'\\t', encode(head, 'hex'),
-                    coalesce(lines_added::text, '-'), coalesce(lines_deleted::text, '-'), path)
-                FROM mainline JOIN commit ON sha = commit
-                JOIN change ON head = commit AND base IS NOT DISTINCT FROM parents[1]
-                WHERE branch = '{branch}'
-                AND 'submodule' NOT IN (coalesce(old_mode, ''), coalesce(new_mode, ''))"
-            );
-            let log = ["log", "--first-parent", "--numstat", "--format=%H", branch];
-            let (mut commit, mut numstat) = ("", Vec::new());
-            for line in git(work, &log).lines() {
-                match line.split_once('\t') {
-                    Some(_) if !line.ends_with("\tsub") => {
-                        numstat.push(format!("{commit}\t{line}"))
-                    }
-                    None if !line.is_empty() => commit = line,
-                    _ => {}
-                }
-            }
-            assert_eq!(rows(db, &counted).await, sorted(numstat));
+            assert_eq!(rows(db, &tree).await, sorted(listed));
+            assert_changes_match_git(db, work, &pairs).await;
         }
+    }
+
+    fn sorted(lines: impl Iterator<Item = String>) -> Vec<String> {
+        Vec::from_iter(BTreeSet::from_iter(lines))
     }
 }

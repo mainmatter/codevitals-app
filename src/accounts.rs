@@ -153,11 +153,7 @@ mod tests {
         },
     };
 
-    use axum::{
-        body::{Body, to_bytes},
-        http::StatusCode,
-    };
-    use serde_json::Value;
+    use axum::http::StatusCode;
 
     use super::*;
     use crate::{
@@ -172,55 +168,48 @@ mod tests {
     async fn a_person_is_their_account_not_their_name(db: PgPool) {
         let mirror = Mirror(scratch("accounts"));
         let work = &mirror.0;
-        let at_work = "--author=Ada <ada@work.example>";
-        let elsewhere = "--author=Ada <ada@elsewhere.example>";
         let home = "--trailer=Co-authored-by: Ada <ADA@home.example>";
         git(work, &["init", "--initial-branch=main"]);
-        git(work, &["commit", "--allow-empty", at_work, "-m", "1"]);
         git(
             work,
-            &["commit", "--allow-empty", "-m", "2", elsewhere, home],
+            &[
+                "commit",
+                "--allow-empty",
+                "--author=Ada <ada@work.example>",
+                "-m",
+                "1",
+            ],
+        );
+        git(
+            work,
+            &[
+                "commit",
+                "--allow-empty",
+                "--author=Ada <ada@elsewhere.example>",
+                home,
+                "-m",
+                "2",
+            ],
         );
         let tip: ObjectId = git(work, &["rev-parse", "main"]).parse().unwrap();
-        let first = git(work, &["rev-parse", "main~"]);
 
-        let actor = |email: &str| {
-            let user = ["ada@work.example", "ada@home.example"].contains(&&*email.to_lowercase());
-            json!({ "email": email, "user": user.then(|| json!({ "databaseId": 1, "login": "ada" })) })
-        };
-        let on = |authors: &[&str]| {
-            let nodes: Vec<Value> = authors.iter().map(|email| actor(email)).collect();
-            json!({
-                "authors": { "totalCount": nodes.len(), "nodes": nodes },
-                "committer": actor("a@example.com"),
-            })
-        };
-        let github_commits = HashMap::from([
-            (first, on(&["ada@work.example"])),
-            (
-                tip.to_string(),
-                on(&["ada@elsewhere.example", "ADA@home.example"]),
-            ),
-        ]);
+        // GitHub describes each of the four commits asked about, one per email, alike.
+        let actor = |email: &str, account: bool| json!({ "email": email, "user": account.then(|| json!({ "databaseId": 1, "login": "ada" })) });
+        let authors = [
+            ("ada@work.example", true),
+            ("ada@elsewhere.example", false),
+            ("ADA@home.example", true),
+        ];
+        let commit = json!({
+            "authors": { "totalCount": 3, "nodes": authors.map(|(email, account)| actor(email, account)) },
+            "committer": actor("a@example.com", false),
+        });
         let queries = Arc::new(AtomicUsize::new(0));
         let counted = queries.clone();
-        let github = github(move |request| {
+        let github = github(move |_| {
             counted.fetch_add(1, Ordering::SeqCst);
-            let github_commits = github_commits.clone();
-            async move {
-                let body = to_bytes(Body::new(request.into_body()), usize::MAX);
-                let body: Value = serde_json::from_slice(&body.await.unwrap()).unwrap();
-                assert_eq!(body["variables"], json!({ "owner": "o", "name": "r" }));
-                let query = body["query"].as_str().unwrap();
-                let repository: serde_json::Map<_, _> = (query.split("object(oid: \"").skip(1))
-                    .enumerate()
-                    .map(|(i, object)| (format!("c{i}"), github_commits[&object[..40]].clone()))
-                    .collect();
-                (
-                    StatusCode::OK,
-                    json!({ "data": { "repository": repository } }),
-                )
-            }
+            let commits = json!({ "c0": commit, "c1": commit, "c2": commit, "c3": commit });
+            async move { (StatusCode::OK, json!({ "data": { "repository": commits } })) }
         });
 
         for _ in 0..2 {

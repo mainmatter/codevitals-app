@@ -44,14 +44,8 @@ pub async fn webhook(State(app): State<Arc<App>>, headers: HeaderMap, body: Byte
         return StatusCode::UNAUTHORIZED;
     }
 
-    // Parsed in full, so that malformed deliveries are rejected.
-    let event = match WebhookEvent::try_from_header_and_body(header("x-github-event"), &body) {
-        Ok(event) => event,
-        Err(error) => {
-            warn!(%error, "webhook unreadable");
-            return StatusCode::BAD_REQUEST;
-        }
-    };
+    let event = WebhookEvent::try_from_header_and_body(header("x-github-event"), &body);
+    let event = event.expect("a delivery GitHub signed");
     let named = match event.specific {
         WebhookEventPayload::Installation(payload) => payload.repositories.unwrap_or_default(),
         WebhookEventPayload::InstallationRepositories(payload) => {

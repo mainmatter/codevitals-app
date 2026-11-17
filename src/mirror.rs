@@ -1,8 +1,8 @@
 //! A bare mirror of each repository: the source of all code data.
 //!
 //! 1. [`Mirror::update`] [`fetch`]es GitHub's branches and pull request heads.
-//! 2. [`prune`] deletes those GitHub no longer has, and keeps every pull request head as
-//!    `refs/pull-heads/<oid>`, so a head replaced by a force-push stays readable.
+//! 2. [`prune`] deletes those GitHub no longer has. Their objects stay: nothing collects garbage,
+//!    so a head replaced by a force-push stays readable.
 //! 3. [`Mirror::run`] and [`Mirror::read_each`] read the mirror on rayon's thread pool, keeping
 //!    CPU-bound work off the async runtime.
 //!
@@ -21,12 +21,11 @@ use std::{
 
 use gix::{
     ObjectId,
-    bstr::ByteSlice,
     credentials::{helper::Action, protocol::Outcome},
     progress::Discard,
     refs::{
-        FullName, Target,
-        transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog},
+        FullName,
+        transaction::{Change, PreviousValue, RefEdit, RefLog},
     },
     remote::Direction,
     sec::identity::Account,
@@ -45,11 +44,24 @@ const REFSPECS: [&str; 2] = [
     "+refs/heads/*:refs/heads/*",
     "+refs/pull/*/head:refs/pull/*/head",
 ];
-const PULL_REQUEST_HEADS: &str = "refs/pull/";
-const KEPT_HEADS: &str = "refs/pull-heads/";
 
 /// Ref names and the commits they point to.
 pub type Refs = HashMap<FullName, ObjectId>;
+
+/// The tip of branch `name`, if GitHub has it.
+pub fn branch(refs: &Refs, name: &str) -> Result<Option<ObjectId>> {
+    Ok(refs
+        .get(&FullName::try_from(format!("refs/heads/{name}"))?)
+        .copied())
+}
+
+/// Every pull request's head.
+pub fn pull_heads(refs: &Refs) -> impl Iterator<Item = ObjectId> {
+    let pull_heads = refs
+        .iter()
+        .filter(|(name, _)| name.as_bstr().starts_with(b"refs/pull/"));
+    pull_heads.map(|(_, head)| *head)
+}
 
 /// Creates `dir`, readable by this user only.
 pub fn prepare(dir: &Path) -> io::Result<()> {
@@ -103,8 +115,8 @@ impl Mirror {
         receive.await?
     }
 
-    /// The shape of every step: `read` each item, a batch at a time in parallel, and hand what it
-    /// read to `insert`, in order.
+    /// The shape of every step: `read` each item, [`limits::READ_AT_ONCE`] at a time in parallel,
+    /// and hand what it read to `insert`, in order.
     pub async fn read_each<I, T, F>(
         &self,
         items: &[I],
@@ -116,7 +128,7 @@ impl Mirror {
         T: Send + 'static,
         F: Future<Output = Result>,
     {
-        for batch in items.chunks(limits::BATCH) {
+        for batch in items.chunks(limits::READ_AT_ONCE) {
             let batch = batch.to_vec();
             let read = self.run(move |repo| {
                 let (repo, span) = (repo.clone().into_sync(), Span::current());
@@ -141,13 +153,9 @@ impl Mirror {
         Ok(gix::open_opts(&self.0, options)?)
     }
 
-    /// Initialised beside the mirror and moved into place, so it is never half a repository.
     fn open_or_init(&self) -> Result<gix::Repository> {
         if !self.0.exists() {
-            let new = self.0.with_added_extension("new");
-            remove_dir(&new)?;
-            gix::init_bare(&new)?;
-            fs::rename(&new, &self.0)?;
+            gix::init_bare(&self.0)?;
         }
         self.open()
     }
@@ -197,42 +205,20 @@ fn fetch(
 
 // 2. Prune
 
-/// gix fetches without pruning. Wanted are GitHub's refs, every kept head, and a kept head for each
-/// pull request head; the refs that differ are written in one transaction.
+/// gix fetches without pruning.
 fn prune(repo: &gix::Repository, github: &Refs) -> Result {
-    let refs = read_refs(repo)?;
-    let starts_with = |name: &FullName, prefix: &str| name.as_bstr().starts_with_str(prefix);
-    let mut wanted = github.clone();
-    for (name, &oid) in &refs {
-        if starts_with(name, KEPT_HEADS) {
-            wanted.insert(name.clone(), oid);
-        }
-        if starts_with(name, PULL_REQUEST_HEADS) {
-            let kept = FullName::try_from(format!("{KEPT_HEADS}{oid}")).expect("a valid ref name");
-            wanted.insert(kept, oid);
-        }
-    }
-    limits::check(wanted.len(), limits::MIRROR_REFS, REFS)?;
-
-    let deleted = (refs.keys().filter(|name| !wanted.contains_key(*name))).map(|name| RefEdit {
+    let gone = read_refs(repo)?
+        .into_keys()
+        .filter(|name| !github.contains_key(name));
+    let deleted = gone.map(|name| RefEdit {
         change: Change::Delete {
             expected: PreviousValue::Any,
             log: RefLog::AndReference,
         },
-        name: name.clone(),
+        name,
         deref: false,
     });
-    let created =
-        (wanted.iter().filter(|(name, _)| !refs.contains_key(*name))).map(|(name, &oid)| RefEdit {
-            change: Change::Update {
-                log: LogChange::default(),
-                expected: PreviousValue::Any,
-                new: Target::Object(oid),
-            },
-            name: name.clone(),
-            deref: false,
-        });
-    repo.edit_references(deleted.chain(created).collect::<Vec<_>>())?;
+    repo.edit_references(deleted.collect::<Vec<_>>())?;
     Ok(())
 }
 
@@ -263,10 +249,10 @@ mod tests {
     use super::*;
     use crate::fixtures::{git, scratch};
 
-    /// GitHub holds `main`, `gone`, and pull requests 1 and 2 with the same head. Then `main`
-    /// moves, pull request 1 is force-pushed and `gone` deleted.
+    /// GitHub holds `main`, `gone` and a pull request head. Then the head is force-pushed and
+    /// `gone` deleted.
     #[tokio::test]
-    async fn a_replaced_pull_request_head_stays_readable() {
+    async fn the_mirror_holds_githubs_refs() {
         let root = scratch("mirror");
         let (github, work) = (root.join("github.git"), root.join("work"));
         git(&root, &["init", "--bare", "github.git"]);
@@ -281,33 +267,36 @@ mod tests {
         let push = |refspec| git(&work, &["push", "--force", "../github.git", refspec]);
         git(&work, &["commit", "--allow-empty", "-m", "root"]);
         let a = amend("a");
-        push("HEAD:refs/heads/main");
-        push("HEAD:refs/heads/gone");
-        push("HEAD:refs/pull/1/head");
-        push("HEAD:refs/pull/2/head");
+        for refspec in [
+            "HEAD:refs/heads/main",
+            "HEAD:refs/heads/gone",
+            "HEAD:refs/pull/1/head",
+        ] {
+            push(refspec);
+        }
 
         let mirror = Mirror::new(&root, RepositoryId(1));
         let url = github.to_str().unwrap().to_owned();
         mirror.update(url.clone(), "".into()).await.unwrap();
         let b = amend("b");
-        push("HEAD:refs/heads/main");
         push("HEAD:refs/pull/1/head");
         push(":refs/heads/gone");
-        mirror.update(url.clone(), "".into()).await.unwrap();
+        let refs = mirror.update(url.clone(), "".into()).await.unwrap();
 
-        let refs = git(
+        let listed = git(
             &mirror.0,
             &["for-each-ref", "--format=%(refname) %(objectname)"],
         );
-        let mut expected = vec![
-            format!("refs/heads/main {b}"),
-            format!("refs/pull-heads/{a} {a}"),
-            format!("refs/pull-heads/{b} {b}"),
-            format!("refs/pull/1/head {b}"),
-            format!("refs/pull/2/head {a}"),
-        ];
-        expected.sort();
-        assert_eq!(Vec::from_iter(refs.lines()), expected);
+        let mut fetched = Vec::from_iter(refs.iter().map(|(name, oid)| format!("{name} {oid}")));
+        fetched.sort();
+        assert_eq!(
+            fetched,
+            [
+                format!("refs/heads/main {a}"),
+                format!("refs/pull/1/head {b}")
+            ]
+        );
+        assert_eq!(Vec::from_iter(listed.lines()), fetched);
         let config = fs::read_to_string(mirror.0.join("config")).unwrap();
         assert!(!config.contains(&url), "{config}");
         remove_dir(&root).unwrap();

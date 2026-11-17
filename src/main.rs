@@ -18,6 +18,7 @@ mod fixtures;
 mod limits;
 mod mainline;
 mod mirror;
+mod pull_heads;
 mod pulls;
 mod sign_in;
 mod sync;
@@ -211,48 +212,24 @@ fn column<'r, R, T>(rows: &'r [R], field: impl Fn(&'r R) -> T) -> Vec<T> {
 
 /// Every item of GitHub's list at `path`. Fails past `limit` items.
 async fn list<T: DeserializeOwned>(github: &Octocrab, path: &str, limit: usize) -> Result<Vec<T>> {
-    let (mut pages, mut items) = (Pages::new(github, path, limit, 1), Vec::new());
-    while let Some(mut page) = pages.next().await? {
+    let mut items = Vec::new();
+    for number in 1.. {
+        let mut page = page(github, path, number).await?;
+        let last = page.len() < limits::PER_PAGE;
         items.append(&mut page);
+        limits::check(items.len(), limit, path)?;
+        if last {
+            break;
+        }
     }
     Ok(items)
 }
 
-/// GitHub's list at `path`, a page at a time from page `first`. Fails past `limit` items,
-/// counting those on the pages before `first`.
-struct Pages<'a> {
-    github: &'a Octocrab,
-    path: &'a str,
-    limit: usize,
-    pages: usize,
-    items: usize,
-}
-
-impl<'a> Pages<'a> {
-    fn new(github: &'a Octocrab, path: &'a str, limit: usize, first: usize) -> Self {
-        let pages = first - 1;
-        let items = pages * limits::PER_PAGE;
-        Pages {
-            github,
-            path,
-            limit,
-            pages,
-            items,
-        }
-    }
-
-    /// Only the last page is short, and may be empty.
-    async fn next<T: DeserializeOwned>(&mut self) -> Result<Option<Vec<T>>> {
-        if self.items < self.pages * limits::PER_PAGE {
-            return Ok(None);
-        }
-        self.pages += 1;
-        let query = [("per_page", limits::PER_PAGE), ("page", self.pages)];
-        let page: Page<T> = self.github.get(self.path, Some(&query)).await?;
-        self.items += page.items.len();
-        limits::check(self.items, self.limit, &format!("items at {}", self.path))?;
-        Ok(Some(page.items))
-    }
+/// Page `number` of GitHub's list at `path`, from 1. Only the last page is short.
+async fn page<T: DeserializeOwned>(github: &Octocrab, path: &str, number: usize) -> Result<Vec<T>> {
+    let query = [("per_page", limits::PER_PAGE), ("page", number)];
+    let page: Page<T> = github.get(path, Some(&query)).await?;
+    Ok(page.items)
 }
 
 #[cfg(test)]

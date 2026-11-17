@@ -16,11 +16,9 @@ CREATE TABLE repo (
     id bigint PRIMARY KEY,
     -- As of the latest sync.
     full_name text NOT NULL,
-    -- How far `pull` is read, in GitHub's list by update time, newest first: every pull request
-    -- updated before `pulls_since` has a current row, except those from page `pulls_page` on,
-    -- which a first sync has yet to read. Null before the first.
-    pulls_since timestamptz,
-    pulls_page int
+    -- The newest update a complete read of GitHub's pull requests saw: every pull request updated
+    -- before it has a current row. Null before the first.
+    pulls_since timestamptz
 );
 
 -- # Commits
@@ -142,6 +140,31 @@ CREATE TABLE pull (
     -- `User`, `Bot`, `Organization`, ...
     author_type text NOT NULL,
     PRIMARY KEY (repo, number)
+);
+
+-- Each head a pull request was seen with, and its merge-base with the base branch's tip then. A
+-- head without one has no row. Inserted with its `pull_commit` rows, after its commits and its
+-- diff, from the merge-base to the head, are in `commit` and `change`.
+CREATE TABLE pull_head (
+    repo bigint NOT NULL,
+    number int NOT NULL,
+    head sha NOT NULL REFERENCES commit,
+    merge_base sha NOT NULL REFERENCES commit,
+    first_seen timestamptz NOT NULL,
+    PRIMARY KEY (repo, number, head),
+    FOREIGN KEY (repo, number) REFERENCES pull ON DELETE CASCADE
+);
+
+-- The commits after a head's merge-base, as `git rev-list --reverse merge_base..head` lists them:
+-- `position` counts from the oldest, 0.
+CREATE TABLE pull_commit (
+    repo bigint NOT NULL,
+    number int NOT NULL,
+    head sha NOT NULL,
+    commit sha NOT NULL REFERENCES commit,
+    position int NOT NULL CHECK (position >= 0),
+    PRIMARY KEY (repo, number, head, position),
+    FOREIGN KEY (repo, number, head) REFERENCES pull_head ON DELETE CASCADE
 );
 
 -- # People

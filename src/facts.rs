@@ -1,5 +1,6 @@
-//! Facts about the content of every blob in a repository's tracked branches: a `blob_fact` row
-//! per blob and language, and a `fn_fact` row per function in it.
+//! Facts about the content of every blob on a repository's tracked branches, and on either side
+//! of each pull request head's diff from its merge-base: a `blob_fact` row per blob and language,
+//! and a `fn_fact` row per function in it.
 //!
 //! 1. [`missing`]: blobs without rows from this [`EXTRACTOR`].
 //! 2. [`extract`] their facts.
@@ -34,18 +35,28 @@ pub async fn record(db: &PgPool, mirror: &Mirror, repository: RepositoryId) -> R
 
 // 1. Missing
 
-/// Each blob a change on a tracked branch writes. A branch's history starts from nothing, so
-/// every blob it holds or held was written by one of its changes.
+/// Both sides of each change between the pairs the repository refers to: its branches' commits
+/// and their first parents, and its pull request heads and their merge-bases.
 async fn missing(db: &PgPool, repository: RepositoryId) -> Result<Vec<(ObjectId, Option<String>)>> {
     let missing: Vec<(Vec<u8>, Option<String>)> = sqlx::query_as(
-        "SELECT DISTINCT ch.new_oid, language(ch.path, ch.new_mode)
-         FROM mainline m
-         JOIN commit c ON c.sha = m.commit
-         JOIN change ch ON ch.head = m.commit AND ch.base IS NOT DISTINCT FROM c.parents[1]
-         WHERE m.repo = $1 AND ch.new_mode <> 'submodule' AND NOT EXISTS (
+        "WITH pair AS (
+             SELECT c.parents[1] AS base, m.commit AS head
+             FROM mainline m JOIN commit c ON c.sha = m.commit
+             WHERE m.repo = $1
+             UNION
+             SELECT merge_base, head FROM pull_head WHERE repo = $1
+         ), side AS (
+             SELECT ch.path, s.oid, s.mode
+             FROM pair
+             JOIN change ch ON ch.head = pair.head AND ch.base IS NOT DISTINCT FROM pair.base
+             CROSS JOIN LATERAL (VALUES (ch.old_oid, ch.old_mode), (ch.new_oid, ch.new_mode))
+                 AS s (oid, mode)
+         )
+         SELECT DISTINCT oid, language(path, mode) FROM side
+         WHERE mode <> 'submodule' AND NOT EXISTS (
              SELECT FROM blob_fact f
-             WHERE (f.blob, f.extractor) = (ch.new_oid, $2)
-             AND f.language IS NOT DISTINCT FROM language(ch.path, ch.new_mode)
+             WHERE (f.blob, f.extractor) = (side.oid, $2)
+             AND f.language IS NOT DISTINCT FROM language(side.path, side.mode)
          )
          LIMIT $3",
     )
@@ -194,13 +205,9 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::{
-        commits,
-        fixtures::{commit, git, repo, rows, scratch, submodule, write},
-        mainline,
+    use crate::fixtures::{
+        self, assert_every_blob_has_facts, commit, git, repo, rows, scratch, submodule, write,
     };
-
-    const REPOSITORY: RepositoryId = RepositoryId(1);
 
     /// A blob of each status and language, the same bytes at a Rust and a text path, a symlink and a
     /// submodule.
@@ -250,13 +257,7 @@ mod tests {
             JOIN blob_fact f ON f.blob = ch.new_oid
             AND f.language IS NOT DISTINCT FROM language(ch.path, ch.new_mode)
             WHERE c.subject = 'everything'";
-        let tip: ObjectId = git(work, &["rev-parse", "main"]).parse().unwrap();
-        let sync = async || {
-            commits::record(&db, &mirror, vec![tip]).await?;
-            mainline::record(&db, &mirror, REPOSITORY, &[("main".into(), tip)]).await?;
-            record(&db, &mirror, REPOSITORY).await
-        };
-        sync().await.unwrap();
+        fixtures::record(&db, &mirror, &["main"]).await;
         assert_eq!(
             rows(&db, per_file).await,
             [
@@ -276,11 +277,7 @@ mod tests {
                 "link.rs unsupported 4 1 0",
             ]
         );
-        let sides_without_facts = "SELECT count(*)::text FROM change ch
-            CROSS JOIN LATERAL (VALUES (ch.old_oid, ch.old_mode), (ch.new_oid, ch.new_mode)) s (oid, mode)
-            WHERE s.mode <> 'submodule' AND NOT EXISTS (SELECT FROM blob_fact f WHERE f.blob = s.oid
-                AND f.language IS NOT DISTINCT FROM language(ch.path, s.mode))";
-        assert_eq!(rows(&db, sides_without_facts).await, ["0"]);
+        assert_every_blob_has_facts(&db).await;
 
         let every_row = "SELECT concat_ws(' ', encode(blob, 'hex'), language, extractor, status, bytes, lines, tokens, errors)
             FROM blob_fact UNION ALL
@@ -288,18 +285,11 @@ mod tests {
                 parameters, branch_points, max_nesting, encode(shape, 'hex'), test, errors)
             FROM fn_fact";
         let first_run = rows(&db, every_row).await;
-        sync().await.unwrap();
-        assert_eq!(
-            rows(&db, every_row).await,
-            first_run,
-            "a second run changes nothing"
-        );
-
         sqlx::query("UPDATE blob_fact SET extractor = extractor - 1")
             .execute(&db)
             .await
             .unwrap();
-        sync().await.unwrap();
+        fixtures::record(&db, &mirror, &["main"]).await;
         assert_eq!(
             rows(&db, every_row).await,
             first_run,

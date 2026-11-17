@@ -2,14 +2,15 @@
 
 use std::iter;
 
-use gix::{ObjectId, refs::FullName};
+use gix::ObjectId;
 use octocrab::{Octocrab, models::RepositoryId, secrecy::SecretString};
+use sqlx::PgPool;
 use tracing::info;
 
 use crate::{
     App, Result, accounts, commits, facts, mainline,
-    mirror::{Mirror, Refs},
-    pulls,
+    mirror::{self, Mirror, Refs},
+    pull_heads, pulls,
 };
 
 /// Read from GitHub at the start of each sync.
@@ -36,13 +37,10 @@ pub async fn sync(app: &App, context: &Context) -> Result {
         .execute(db)
         .await?;
 
-    let branches = tracked_branches(app, context, &refs)?;
-    let tips = branches.iter().map(|(_, tip)| *tip).collect();
-    let commits = commits::record(db, &mirror, tips).await?;
-    mainline::record(db, &mirror, repository, &branches).await?;
-    facts::record(db, &mirror, repository).await?;
-    accounts::record(&context.github, db, &context.full_name, &commits).await?;
     pulls::record(&context.github, db, repository, &context.full_name).await?;
+    let branches = tracked_branches(app, context, &refs)?;
+    let commits = record(db, &mirror, repository, &refs, &branches).await?;
+    accounts::record(&context.github, db, &context.full_name, &commits).await?;
     info!(repository = repository.0, "synced");
     Ok(())
 }
@@ -54,11 +52,31 @@ fn tracked_branches(app: &App, context: &Context, refs: &Refs) -> Result<Vec<(St
         .map(|(_, branch)| branch);
     let mut branches = Vec::new();
     for name in iter::once(&context.default_branch).chain(configured) {
-        if let Some(&tip) = refs.get(&FullName::try_from(format!("refs/heads/{name}"))?) {
+        if let Some(tip) = mirror::branch(refs, name)? {
             branches.push((name.clone(), tip));
         }
     }
     Ok(branches)
+}
+
+/// Everything derived from the mirror alone. Returns the commits its branches and pull requests
+/// reach.
+pub async fn record(
+    db: &PgPool,
+    mirror: &Mirror,
+    repository: RepositoryId,
+    refs: &Refs,
+    branches: &[(String, ObjectId)],
+) -> Result<Vec<ObjectId>> {
+    let tips = branches
+        .iter()
+        .map(|(_, tip)| *tip)
+        .chain(mirror::pull_heads(refs));
+    let commits = commits::record(db, mirror, tips.collect()).await?;
+    mainline::record(db, mirror, repository, branches).await?;
+    pull_heads::record(db, mirror, repository, refs).await?;
+    facts::record(db, mirror, repository).await?;
+    Ok(commits)
 }
 
 /// Its rows go with it.

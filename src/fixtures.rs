@@ -1,22 +1,30 @@
 //! What tests share: scratch repositories made with git, a fake GitHub, and rows as text.
 
 use std::{
+    collections::BTreeSet,
     convert::Infallible,
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
 };
 
 use axum::http::{Request, Response, StatusCode, Uri};
 use octocrab::{
-    AuthState, OctoBody, Octocrab, OctocrabBuilder, service::middleware::base_uri::BaseUriLayer,
+    AuthState, OctoBody, Octocrab, OctocrabBuilder, models::RepositoryId,
+    service::middleware::base_uri::BaseUriLayer,
 };
 use serde_json::Value;
 use sqlx::PgPool;
 use tower::service_fn;
 
-use crate::App;
+use crate::{
+    App, app,
+    mirror::{self, Mirror, Refs},
+};
 
 /// A new, empty directory for test `name`.
 pub fn scratch(name: &str) -> PathBuf {
@@ -26,14 +34,16 @@ pub fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// Runs git in `dir`, as `A <a@example.com>` at a fixed time, and returns its output.
+/// Runs git in `dir`, as `A <a@example.com>` a second after the last run, and returns its output.
 pub fn git(dir: &Path, args: &[&str]) -> String {
+    static SECONDS: AtomicI64 = AtomicI64::new(1_577_860_200);
+    let date = format!("{} +0530", SECONDS.fetch_add(1, Ordering::Relaxed));
     let output = Command::new("git")
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_DATE", "2020-01-01T12:00:00+05:30")
-        .env("GIT_COMMITTER_DATE", "2020-01-01T12:00:00+05:30")
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
         .args(["-c", "user.name=A", "-c", "user.email=a@example.com"])
         .args(args)
         .output()
@@ -73,6 +83,83 @@ pub async fn rows(db: &PgPool, sql: &str) -> Vec<String> {
     let mut rows: Vec<String> = rows.await.unwrap();
     rows.sort();
     rows
+}
+
+/// [`app::record`] for repository 1 from the work repository `mirror`, tracking `branches`. Twice:
+/// the second run must change nothing.
+pub async fn record(db: &PgPool, mirror: &Mirror, branches: &[&str]) {
+    let refs = git(
+        &mirror.0,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+    );
+    let refs = Refs::from_iter(refs.lines().map(|line| {
+        let (name, oid) = line.split_once(' ').unwrap();
+        (name.try_into().unwrap(), oid.parse().unwrap())
+    }));
+    let tip = |name: &&str| {
+        (
+            name.to_string(),
+            mirror::branch(&refs, name).unwrap().unwrap(),
+        )
+    };
+    let branches = Vec::from_iter(branches.iter().map(tip));
+    let every_row = [
+        "commit",
+        "commit_person",
+        "change",
+        "mainline",
+        "pull_head",
+        "pull_commit",
+        "blob_fact",
+        "fn_fact",
+    ]
+    .map(|table| format!("SELECT '{table} ' || t::text FROM {table} t"));
+    let every_row = every_row.join(" UNION ALL ");
+    let mut first_run = None;
+    for _ in 0..2 {
+        app::record(db, mirror, RepositoryId(1), &refs, &branches)
+            .await
+            .unwrap();
+        let run = rows(db, &every_row).await;
+        assert_eq!(*first_run.get_or_insert(run.clone()), run);
+    }
+}
+
+/// git's empty tree, the base of a root commit.
+pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// Each pair's `change` rows are what `git diff --numstat` lists, submodules aside: git counts
+/// their `Subproject commit` lines.
+pub async fn assert_changes_match_git(db: &PgPool, work: &Path, pairs: &[(String, String)]) {
+    let mut expected = BTreeSet::new();
+    for (base, head) in pairs {
+        let numstat = git(work, &["diff", "--numstat", base, head]);
+        let files = numstat.lines().filter(|line| !line.ends_with("\tsub"));
+        expected.extend(files.map(|line| format!("{base} {head}\t{line}")));
+    }
+    let pairs: Vec<String> = pairs
+        .iter()
+        .map(|(b, h)| format!("('{b}', '{h}')"))
+        .collect();
+    let base = format!("coalesce(encode(base, 'hex'), '{EMPTY_TREE}')");
+    let changes = format!(
+        "SELECT DISTINCT concat_ws(E'\\t', {base} || ' ' || encode(head, 'hex'),
+            coalesce(lines_added::text, '-'), coalesce(lines_deleted::text, '-'), path)
+        FROM change
+        WHERE ({base}, encode(head, 'hex')) IN ({})
+        AND 'submodule' NOT IN (coalesce(old_mode, ''), coalesce(new_mode, ''))",
+        pairs.join(", ")
+    );
+    assert_eq!(rows(db, &changes).await, Vec::from_iter(expected));
+}
+
+/// Every side of every change, submodules aside, has facts.
+pub async fn assert_every_blob_has_facts(db: &PgPool) {
+    let without_facts = "SELECT format('%s %s', ch.path, encode(s.oid, 'hex')) FROM change ch
+        CROSS JOIN LATERAL (VALUES (ch.old_oid, ch.old_mode), (ch.new_oid, ch.new_mode)) s (oid, mode)
+        WHERE s.mode <> 'submodule' AND NOT EXISTS (SELECT FROM blob_fact f WHERE f.blob = s.oid
+            AND f.language IS NOT DISTINCT FROM language(ch.path, s.mode))";
+    assert_eq!(rows(db, without_facts).await, Vec::<String>::new());
 }
 
 /// GitHub at `http://github.test`, answering every request with `answer`.
