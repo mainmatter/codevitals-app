@@ -11,6 +11,10 @@ getrandom = "0.4.3"
 gix = { version = "0.90", default-features = false, features = ["sha1", "blob-diff", "revision", "blocking-http-transport-reqwest-rust-tls", "parallel"] }
 # `retry`: retries a request that failed in passing, so a sync of thousands of requests survives one.
 octocrab = { version = "0.54.9", default-features = false, features = ["default-client", "rustls", "rustls-ring", "jwt-rust-crypto", "retry", "timeout", "tracing"] }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+prometheus = { version = "0.14", default-features = false, features = ["process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
@@ -19,7 +23,8 @@ tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "s
 tower = { version = "0.5.3", features = ["limit"] }
 tower-http = { version = "0.7.1", features = ["timeout", "trace"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "registry"] }
 # Exact: a grammar decides facts, so upgrading one means raising `facts::EXTRACTOR`.
 tree-sitter = "=0.27.0"
 tree-sitter-c = "=0.24.2"

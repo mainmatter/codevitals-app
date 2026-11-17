@@ -24,7 +24,7 @@ use tracing::{Instrument, info, info_span};
 use crate::{
     App, Result, accounts, commits, facts, mainline,
     mirror::{self, Mirror, Refs},
-    pull_heads, pulls,
+    pull_heads, pulls, telemetry,
 };
 
 /// Read from GitHub at the start of each sync.
@@ -71,8 +71,18 @@ pub async fn sync(app: &App, context: &Context) -> Result {
 
 /// In a span named after the step, which records how long it took; an error names the step.
 async fn step<T>(name: &'static str, work: impl Future<Output = Result<T>>) -> Result<T> {
+    let started = Instant::now();
     let done = work.instrument(info_span!("step", name)).await;
-    done.map_err(|error| format!("{name}: {error}").into())
+    let outcome = if done.is_ok() { "ok" } else { "error" };
+    let seconds = telemetry::STEP_SECONDS.with_label_values(&[name, outcome]);
+    seconds.observe(started.elapsed().as_secs_f64());
+    done.map_err(|error| {
+        if let Some(octocrab::Error::GitHub { source, .. }) = error.downcast_ref() {
+            let status = source.status_code.as_str();
+            telemetry::GITHUB_ERRORS.with_label_values(&[status]).inc();
+        }
+        format!("{name}: {error}").into()
+    })
 }
 
 /// Moves `full_name` with a rename or transfer.

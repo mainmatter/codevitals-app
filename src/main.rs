@@ -22,6 +22,7 @@ mod pull_heads;
 mod pulls;
 mod sign_in;
 mod sync;
+mod telemetry;
 
 use std::{
     collections::HashMap,
@@ -60,8 +61,7 @@ use tower_http::{
     timeout::TimeoutLayer,
     trace::{DefaultOnResponse, TraceLayer},
 };
-use tracing::{Level, info, info_span};
-use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
+use tracing::{Level, field::Empty, info, info_span, warn};
 
 pub type Result<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -71,6 +71,15 @@ struct Config {
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:3000")]
     listen: SocketAddr,
+    /// Address to serve Prometheus metrics on, at `/metrics`. Keep it off the public listener.
+    #[arg(long = "metrics-listen", value_name = "ADDRESS")]
+    metrics_listen: Option<SocketAddr>,
+    /// OTLP/HTTP URL to send traces to, e.g. `http://127.0.0.1:4318/v1/traces`.
+    #[arg(long = "otlp-traces-url", value_name = "URL")]
+    otlp_traces_url: Option<String>,
+    /// How logs on stderr are written.
+    #[arg(long = "log-format", value_enum, default_value = "text")]
+    log_format: telemetry::LogFormat,
     /// Postgres, e.g. `postgres:///cv?host=/run/postgresql`.
     #[arg(long = "database-url", value_name = "URL")]
     database: PgConnectOptions,
@@ -124,12 +133,9 @@ impl App {
 
 #[tokio::main]
 async fn main() -> Result {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        // A span's duration, when it closes: requests, syncs, and at `debug` each blob's facts.
-        .with_span_events(FmtSpan::CLOSE)
-        .init();
     let config = Config::parse();
+    let traces = telemetry::init(config.log_format, config.otlp_traces_url.as_deref())?;
+    info!(version = env!("CARGO_PKG_VERSION"), "starting");
     mirror::prepare(&config.mirrors)?;
 
     // octocrab waits forever by default, and one stalled request would stall all syncing. Server
@@ -158,10 +164,27 @@ async fn main() -> Result {
 
     let listener = TcpListener::bind(app.config.listen).await?;
     info!(address = %app.config.listen, "listening");
+    if let Some(address) = app.config.metrics_listen {
+        let metrics = TcpListener::bind(address).await?;
+        info!(%address, "serving metrics");
+        let router = Router::new().route("/metrics", get(telemetry::metrics));
+        let serve = axum::serve(metrics, router.with_state(app.clone()));
+        tokio::spawn(async move {
+            if let Err(error) = serve.await {
+                warn!(%error, "serving metrics failed");
+            }
+        });
+    }
     tokio::spawn(sync::resync(app.clone()));
     // Running syncs are dropped on shutdown; the next run completes their work.
     let serve = axum::serve(listener, router(app)).with_graceful_shutdown(shutdown());
-    Ok(serve.into_future().await?)
+    let served = serve.into_future().await;
+    if let Some(traces) = traces
+        && let Err(error) = traces.shutdown()
+    {
+        warn!(%error, "flushing traces failed");
+    }
+    Ok(served?)
 }
 
 fn router(app: Arc<App>) -> Router {
@@ -187,13 +210,16 @@ fn router(app: Arc<App>) -> Router {
                 .make_span_with(|request: &Request<_>| {
                     let header = |name| request.headers().get(name)?.to_str().ok();
                     // The path, not the query: on `/callback` that holds the sign-in code.
-                    info_span!(
+                    let span = info_span!(
                         "request",
                         method = %request.method(),
                         path = request.uri().path(),
                         delivery = header("x-github-delivery"),
                         event = header("x-github-event"),
-                    )
+                        trace_id = Empty,
+                    );
+                    telemetry::link_trace(&span);
+                    span
                 })
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )

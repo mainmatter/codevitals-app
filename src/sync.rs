@@ -9,7 +9,10 @@
 //! 3. [`run`] asks GitHub which installation of the app sees the repository, and syncs it as that
 //!    installation, or forgets it if none does.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     body::Bytes,
@@ -24,9 +27,9 @@ use octocrab::{
     secrecy::ExposeSecret,
 };
 use serde::Deserialize;
-use tracing::{Instrument, info_span, warn};
+use tracing::{Instrument, Span, field::Empty, info, info_span, warn};
 
-use crate::{App, Result, app, limits, list};
+use crate::{App, Result, app, limits, list, telemetry};
 
 // 1. Triggers
 
@@ -41,13 +44,21 @@ pub async fn webhook(State(app): State<Arc<App>>, headers: HeaderMap, body: Byte
     let secret = app.config.webhook_secret.expose_secret();
     if let Err(error) = verify_signature(header("x-hub-signature-256"), secret, &body) {
         warn!(%error, "webhook rejected");
+        telemetry::WEBHOOKS
+            .with_label_values(&["unverified", "unauthorized"])
+            .inc();
         return StatusCode::UNAUTHORIZED;
     }
+    // Signed, so one of GitHub's events.
+    let event = header("x-github-event");
 
     let delivery: Delivery = match serde_json::from_slice(&body) {
         Ok(delivery) => delivery,
         Err(error) => {
             warn!(%error, "webhook unreadable");
+            telemetry::WEBHOOKS
+                .with_label_values(&[event, "unreadable"])
+                .inc();
             return StatusCode::BAD_REQUEST;
         }
     };
@@ -57,12 +68,21 @@ pub async fn webhook(State(app): State<Arc<App>>, headers: HeaderMap, body: Byte
         delivery.repositories_added.unwrap_or_default(),
         delivery.repositories_removed.unwrap_or_default(),
     ];
+    let mut repositories = 0;
     for Named { id: repository } in named.into_iter().flatten() {
         if let Err(error) = schedule(&app, repository) {
             warn!(%error, "webhook turned away");
+            telemetry::WEBHOOKS
+                .with_label_values(&[event, "unavailable"])
+                .inc();
             return StatusCode::SERVICE_UNAVAILABLE;
         }
+        repositories += 1;
     }
+    info!(event, repositories, "webhook accepted");
+    telemetry::WEBHOOKS
+        .with_label_values(&[event, "accepted"])
+        .inc();
     StatusCode::ACCEPTED
 }
 
@@ -86,31 +106,43 @@ struct Named {
 const RESYNC_EVERY: Duration = Duration::from_secs(60 * 60);
 
 pub async fn resync(app: Arc<App>) {
+    telemetry::RESYNC_LAST_SUCCESS.set(telemetry::now());
     let mut interval = tokio::time::interval(RESYNC_EVERY);
     loop {
         interval.tick().await;
-        if let Err(error) = schedule_all(&app).await {
-            warn!(%error, "resync failed");
+        match schedule_all(&app).await {
+            Ok(true) => telemetry::RESYNC_LAST_SUCCESS.set(telemetry::now()),
+            Ok(false) => {}
+            Err(error) => warn!(%error, "resync failed"),
         }
     }
 }
 
-async fn schedule_all(app: &Arc<App>) -> Result {
+/// Whether every installation's repositories were scheduled.
+async fn schedule_all(app: &Arc<App>) -> Result<bool> {
     let installations: Vec<Installation> =
         list(&app.github, "/app/installations", limits::INSTALLATIONS).await?;
-    for installation in installations {
+    let (mut repositories, mut failed) = (0, 0);
+    for installation in &installations {
         let scheduled = async {
             let github = app.github.installation(installation.id)?;
             let repositories: Vec<Repository> =
                 list(&github, "/installation/repositories", limits::REPOSITORIES).await?;
-            repositories.iter().try_for_each(|r| schedule(app, r.id))
+            repositories.iter().try_for_each(|r| schedule(app, r.id))?;
+            Result::Ok(repositories.len())
         };
         // One at a time, so that a suspended installation does not hold up the others.
-        if let Err(error) = scheduled.await {
-            warn!(installation = installation.id.0, %error, "resync failed");
+        match scheduled.await {
+            Ok(scheduled) => repositories += scheduled,
+            Err(error) => {
+                warn!(installation = installation.id.0, %error, "resync failed");
+                failed += 1;
+            }
         }
     }
-    Ok(())
+    let installations = installations.len();
+    info!(installations, repositories, failed, "resync scheduled");
+    Ok(failed == 0)
 }
 
 // 2. Scheduling
@@ -138,16 +170,49 @@ async fn run(app: Arc<App>, repository: RepositoryId) {
                 return;
             }
         }
+        let (started, mut kind) = (Instant::now(), "sync");
         let synced = async {
             match context(&app.github, repository).await? {
-                Some(context) => app::sync(&app, &context).await,
-                None => app::forget(&app, repository).await,
+                Some(context) => {
+                    Span::current().record("full_name", &context.full_name);
+                    app::sync(&app, &context).await
+                }
+                None => {
+                    kind = "forget";
+                    app::forget(&app, repository).await
+                }
             }
         };
         // Never cancelled: blocking work would outlive it, and the next run could overlap it.
-        let span = info_span!("sync", repository = repository.0);
-        if let Err(error) = synced.instrument(span).await {
-            warn!(repository = repository.0, %error, "sync failed");
+        let span = info_span!(
+            "sync",
+            repository = repository.0,
+            full_name = Empty,
+            trace_id = Empty
+        );
+        telemetry::link_trace(&span);
+        let synced = synced.instrument(span).await;
+
+        let outcome = if synced.is_ok() { "ok" } else { "error" };
+        let seconds = telemetry::SYNC_SECONDS.with_label_values(&[kind, outcome]);
+        seconds.observe(started.elapsed().as_secs_f64());
+        let label = [repository.0.to_string()];
+        match (synced, kind) {
+            (Err(error), _) => {
+                warn!(repository = repository.0, kind, %error, "sync failed");
+                telemetry::REPO_FAILURES.with_label_values(&label).inc();
+            }
+            (Ok(()), "forget") => {
+                let _ = telemetry::REPO_LAST_SUCCESS.remove_label_values(&label);
+                let _ = telemetry::REPO_FAILURES.remove_label_values(&label);
+            }
+            (Ok(()), _) => {
+                let now = telemetry::now();
+                telemetry::REPO_LAST_SUCCESS
+                    .with_label_values(&label)
+                    .set(now);
+                telemetry::REPO_FAILURES.with_label_values(&label).set(0);
+            }
         }
     }
 }

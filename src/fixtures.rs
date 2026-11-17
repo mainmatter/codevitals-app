@@ -113,6 +113,9 @@ pub fn app(github: Octocrab) -> Arc<App> {
 pub fn config() -> crate::Config {
     crate::Config {
         listen: ([127, 0, 0, 1], 0).into(),
+        metrics_listen: None,
+        otlp_traces_url: None,
+        log_format: crate::telemetry::LogFormat::Text,
         database: "postgres://unused".parse().unwrap(),
         mirrors: "/unused".into(),
         tracked_branches: Vec::new(),
