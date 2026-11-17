@@ -6,7 +6,7 @@
 //! once there moves `pulls_since` to the newest update it read. A first sync reads to the end; one
 //! cut short starts over.
 
-use octocrab::{Octocrab, models::RepositoryId};
+use octocrab::Octocrab;
 use serde_json::Value;
 use sqlx::{
     PgPool,
@@ -15,49 +15,44 @@ use sqlx::{
 
 use crate::{Result, limits, page};
 
-pub async fn record(
-    github: &Octocrab,
-    db: &PgPool,
-    repository: RepositoryId,
-    full_name: &str,
-) -> Result {
-    let repository = repository.0 as i64;
+/// Returns how many it read.
+pub async fn record(github: &Octocrab, db: &PgPool, repo: i64, full_name: &str) -> Result<usize> {
     let path = format!("/repos/{full_name}/pulls?state=all&sort=updated&direction=desc");
     let since: Option<DateTime<Utc>> =
         sqlx::query_scalar("SELECT pulls_since FROM repo WHERE id = $1")
-            .bind(repository)
+            .bind(repo)
             .fetch_one(db)
             .await?;
-    let mut newest = None;
+    let (mut newest, mut read) = (None, 0);
     'read: for number in 1.. {
         let pulls: Vec<Value> = page(github, &path, number).await?;
-        let read = (number - 1) * limits::PER_PAGE + pulls.len();
-        limits::check(read, limits::PULLS, "pull requests")?;
+        limits::check(read + pulls.len(), limits::PULLS, "pull requests")?;
         for pull in &pulls {
             let updated: DateTime<Utc> = serde_json::from_value(pull["updated_at"].clone())?;
             newest.get_or_insert(updated);
             if since.is_some_and(|since| updated < since) {
                 break 'read;
             }
-            upsert(db, repository, pull).await?;
+            upsert(db, repo, pull).await?;
+            read += 1;
         }
         if pulls.len() < limits::PER_PAGE {
             break;
         }
     }
     sqlx::query("UPDATE repo SET pulls_since = coalesce($2, pulls_since) WHERE id = $1")
-        .bind(repository)
+        .bind(repo)
         .bind(newest)
         .execute(db)
         .await?;
-    Ok(())
+    Ok(read)
 }
 
 /// As GitHub lists it, a field it leaves out an error. A deleted account is GitHub's `ghost`. Until
 /// merged, `merge_commit_sha` is a trial merge GitHub redoes without moving `updated_at`, so it is
 /// kept only once merged. Never replaces a row with an older description: a pull request listed
 /// twice is written once.
-async fn upsert(db: &PgPool, repository: i64, pull: &Value) -> Result {
+async fn upsert(db: &PgPool, repo: i64, pull: &Value) -> Result {
     sqlx::query(
         r#"INSERT INTO pull
          SELECT $1, p.number, p.state, p.draft, p.base->>'ref', decode(p.head->>'sha', 'hex'),
@@ -74,7 +69,7 @@ async fn upsert(db: &PgPool, repository: i64, pull: &Value) -> Result {
               merge_commit, author_id, author_login, author_type) = ROW(EXCLUDED.*)
          WHERE pull.updated < EXCLUDED.updated"#,
     )
-    .bind(repository)
+    .bind(repo)
     .bind(pull.to_string())
     .execute(db)
     .await?;
@@ -132,7 +127,7 @@ mod tests {
         });
         let sync = async |expected_pages| {
             pages.store(0, Ordering::SeqCst);
-            record(&github, &db, RepositoryId(1), "o/r").await.unwrap();
+            record(&github, &db, 1, "o/r").await.unwrap();
             assert_eq!(pages.load(Ordering::SeqCst), expected_pages);
         };
 

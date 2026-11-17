@@ -19,11 +19,11 @@ use axum::{
 use octocrab::{
     Octocrab,
     models::{
-        Installation, Repository, RepositoryId,
-        webhook_events::{WebhookEvent, WebhookEventPayload, verification::verify_signature},
+        Installation, Repository, RepositoryId, webhook_events::verification::verify_signature,
     },
     secrecy::ExposeSecret,
 };
+use serde::Deserialize;
 use tracing::{Instrument, info_span, warn};
 
 use crate::{App, Result, app, limits, list};
@@ -44,24 +44,42 @@ pub async fn webhook(State(app): State<Arc<App>>, headers: HeaderMap, body: Byte
         return StatusCode::UNAUTHORIZED;
     }
 
-    let event = WebhookEvent::try_from_header_and_body(header("x-github-event"), &body);
-    let event = event.expect("a delivery GitHub signed");
-    let named = match event.specific {
-        WebhookEventPayload::Installation(payload) => payload.repositories.unwrap_or_default(),
-        WebhookEventPayload::InstallationRepositories(payload) => {
-            [payload.repositories_added, payload.repositories_removed].concat()
+    let delivery: Delivery = match serde_json::from_slice(&body) {
+        Ok(delivery) => delivery,
+        Err(error) => {
+            warn!(%error, "webhook unreadable");
+            return StatusCode::BAD_REQUEST;
         }
-        _ => Vec::new(),
     };
-    let repositories = (event.repository.map(|repository| repository.id).into_iter())
-        .chain(named.into_iter().map(|repository| repository.id));
-    for repository in repositories {
+    let named = [
+        delivery.repository.into_iter().collect(),
+        delivery.repositories.unwrap_or_default(),
+        delivery.repositories_added.unwrap_or_default(),
+        delivery.repositories_removed.unwrap_or_default(),
+    ];
+    for Named { id: repository } in named.into_iter().flatten() {
         if let Err(error) = schedule(&app, repository) {
             warn!(%error, "webhook turned away");
             return StatusCode::SERVICE_UNAVAILABLE;
         }
     }
     StatusCode::ACCEPTED
+}
+
+/// The repositories any event names; GitHub's models of the rest change faster than octocrab's.
+#[derive(Deserialize)]
+struct Delivery {
+    repository: Option<Named>,
+    /// Of `installation` events.
+    repositories: Option<Vec<Named>>,
+    /// Of `installation_repositories` events.
+    repositories_added: Option<Vec<Named>>,
+    repositories_removed: Option<Vec<Named>>,
+}
+
+#[derive(Deserialize)]
+struct Named {
+    id: RepositoryId,
 }
 
 /// GitHub never redelivers a failed webhook; this catches up.
@@ -156,9 +174,11 @@ async fn context(github: &Octocrab, repository: RepositoryId) -> Result<Option<a
     if found.size.ok_or("no size")? > limits::REPOSITORY_KB {
         return Err(format!("more than {} KB on GitHub", limits::REPOSITORY_KB).into());
     }
+    let full_name = found.full_name.ok_or("no full name")?;
     Ok(Some(app::Context {
         repository,
-        full_name: found.full_name.ok_or("no full name")?,
+        url: format!("https://github.com/{full_name}.git"),
+        full_name,
         default_branch: found.default_branch.ok_or("no default branch")?,
         github,
         token,

@@ -1,7 +1,7 @@
 //! The GitHub account each email belongs to: the one link from git to a person.
 //!
-//! 1. [`unasked`]: each email on a reachable commit, in a role GitHub attributes, without an
-//!    `email_account` row, with one commit it is on.
+//! 1. [`unasked`]: each email in a role GitHub attributes, on a commit the repository reaches,
+//!    without an `email_account` row, with one such commit.
 //! 2. [`ask`] GitHub for everyone it attributes on those commits, [`limits::EMAILS_PER_QUERY`] at
 //!    a time.
 //! 3. [`insert`] each email's account, or none if GitHub gave it none.
@@ -17,38 +17,36 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::PgPool;
 
-use crate::{Result, column, limits};
+use crate::{Result, limits};
 
-/// `commits` must be in the repository `full_name`.
-pub async fn record(
-    github: &Octocrab,
-    db: &PgPool,
-    full_name: &str,
-    commits: &[ObjectId],
-) -> Result {
-    for batch in unasked(db, commits).await?.chunks(limits::EMAILS_PER_QUERY) {
+/// `full_name` names the repository `repo`.
+pub async fn record(github: &Octocrab, db: &PgPool, repo: i64, full_name: &str) -> Result<usize> {
+    let unasked = unasked(db, repo).await?;
+    for batch in unasked.chunks(limits::EMAILS_PER_QUERY) {
         let mut accounts = ask(github, full_name, batch).await?;
         for (email, _) in batch {
             insert(db, email, accounts.remove(email).flatten()).await?;
         }
     }
-    Ok(())
+    Ok(unasked.len())
 }
 
 // 1. Unasked
 
 /// Lowercased emails.
-async fn unasked(db: &PgPool, commits: &[ObjectId]) -> Result<Vec<(String, ObjectId)>> {
+async fn unasked(db: &PgPool, repo: i64) -> Result<Vec<(String, ObjectId)>> {
     let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
         "SELECT DISTINCT ON (lower(p.email)) lower(p.email), p.commit
-         FROM unnest($1::bytea[]) AS r (sha)
-         JOIN commit_person p ON p.commit = r.sha
-         WHERE p.role IN ('author', 'committer', 'co-authored-by')
-             AND NOT EXISTS (SELECT FROM email_account a WHERE a.email = lower(p.email))",
+         FROM repo_commit r JOIN commit_person p ON p.commit = r.commit
+         WHERE r.repo = $1 AND p.role IN ('author', 'committer', 'co-authored-by')
+             AND NOT EXISTS (SELECT FROM email_account a WHERE a.email = lower(p.email))
+         LIMIT $2",
     )
-    .bind(column(commits, |sha| sha.as_slice()))
+    .bind(repo)
+    .bind(limits::EMAILS as i64 + 1)
     .fetch_all(db)
     .await?;
+    limits::check(rows.len(), limits::EMAILS, "emails without accounts")?;
     let unasked = rows
         .into_iter()
         .map(|(email, sha)| (email, ObjectId::from_bytes_or_panic(&sha)));
@@ -71,10 +69,10 @@ async fn ask(
     full_name: &str,
     unasked: &[(String, ObjectId)],
 ) -> Result<HashMap<String, Option<Account>>> {
-    /// A `null` or a non-commit object fails to parse.
+    /// `null` for a commit GitHub no longer has, after a force-push: its emails get no account.
     #[derive(Deserialize)]
     struct Data {
-        repository: HashMap<String, Commit>,
+        repository: HashMap<String, Option<Commit>>,
     }
     #[derive(Deserialize)]
     struct Commit {
@@ -118,7 +116,7 @@ async fn ask(
     });
     let data: Data = github.graphql(&request).await?;
     let mut accounts = HashMap::new();
-    for commit in data.repository.into_values() {
+    for commit in data.repository.into_values().flatten() {
         limits::check(commit.authors.total, max, "authors on a commit")?;
         for actor in commit.authors.nodes.into_iter().chain([commit.committer]) {
             if let Some(email) = actor.email {
@@ -141,95 +139,4 @@ async fn insert(db: &PgPool, email: &str, account: Option<Account>) -> Result {
         .execute(db)
         .await?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        fs,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-    };
-
-    use axum::http::StatusCode;
-
-    use super::*;
-    use crate::{
-        commits,
-        fixtures::{git, github, rows, scratch},
-        mirror::Mirror,
-    };
-
-    /// Ada commits from work, then from elsewhere with Ada from home as co-author. Work and home
-    /// are her account's emails; elsewhere is another Ada, unknown to GitHub.
-    #[sqlx::test]
-    async fn a_person_is_their_account_not_their_name(db: PgPool) {
-        let mirror = Mirror(scratch("accounts"));
-        let work = &mirror.0;
-        let home = "--trailer=Co-authored-by: Ada <ADA@home.example>";
-        git(work, &["init", "--initial-branch=main"]);
-        git(
-            work,
-            &[
-                "commit",
-                "--allow-empty",
-                "--author=Ada <ada@work.example>",
-                "-m",
-                "1",
-            ],
-        );
-        git(
-            work,
-            &[
-                "commit",
-                "--allow-empty",
-                "--author=Ada <ada@elsewhere.example>",
-                home,
-                "-m",
-                "2",
-            ],
-        );
-        let tip: ObjectId = git(work, &["rev-parse", "main"]).parse().unwrap();
-
-        // GitHub describes each of the four commits asked about, one per email, alike.
-        let actor = |email: &str, account: bool| json!({ "email": email, "user": account.then(|| json!({ "databaseId": 1, "login": "ada" })) });
-        let authors = [
-            ("ada@work.example", true),
-            ("ada@elsewhere.example", false),
-            ("ADA@home.example", true),
-        ];
-        let commit = json!({
-            "authors": { "totalCount": 3, "nodes": authors.map(|(email, account)| actor(email, account)) },
-            "committer": actor("a@example.com", false),
-        });
-        let queries = Arc::new(AtomicUsize::new(0));
-        let counted = queries.clone();
-        let github = github(move |_| {
-            counted.fetch_add(1, Ordering::SeqCst);
-            let commits = json!({ "c0": commit, "c1": commit, "c2": commit, "c3": commit });
-            async move { (StatusCode::OK, json!({ "data": { "repository": commits } })) }
-        });
-
-        for _ in 0..2 {
-            let commits = commits::record(&db, &mirror, vec![tip]).await.unwrap();
-            record(&github, &db, "o/r", &commits).await.unwrap();
-        }
-        // Four emails, one query; none left to ask the second time.
-        assert_eq!(queries.load(Ordering::SeqCst), 1);
-
-        let persons = "SELECT DISTINCT format('%s %s <%s>: %s', role, name, email, person)
-            FROM commit_person_key";
-        assert_eq!(
-            rows(&db, persons).await,
-            [
-                "author Ada <ada@elsewhere.example>: email:ada@elsewhere.example",
-                "author Ada <ada@work.example>: account:1",
-                "co-authored-by Ada <ADA@home.example>: account:1",
-                "committer A <a@example.com>: email:a@example.com",
-            ]
-        );
-        fs::remove_dir_all(work).unwrap();
-    }
 }

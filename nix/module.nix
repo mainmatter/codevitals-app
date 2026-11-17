@@ -113,6 +113,13 @@ in
         DynamicUser = true;
         StateDirectory = "cv";
         Restart = "on-failure";
+        # Past the default 100ms, a crash loop would hit the start limit and give up quickly.
+        RestartSec = "5s";
+        # Stopping waits for git work in flight; a sync stopped anywhere is finished by the next.
+        TimeoutStopSec = "30s";
+        # Reads hold up to 4 syncs x 32 items x 16 MiB, webhooks 8 x 25 MiB, beside a fetch.
+        MemoryHigh = lib.mkDefault "3G";
+        MemoryMax = lib.mkDefault "4G";
 
         CapabilityBoundingSet = "";
         LockPersonality = true;

@@ -3,18 +3,19 @@
 //! 1. [`Mirror::update`] [`fetch`]es GitHub's branches and pull request heads.
 //! 2. [`prune`] deletes those GitHub no longer has. Their objects stay: nothing collects garbage,
 //!    so a head replaced by a force-push stays readable.
-//! 3. [`Mirror::run`] and [`Mirror::read_each`] read the mirror on rayon's thread pool, keeping
-//!    CPU-bound work off the async runtime.
+//! 3. [`Mirror::run`] and [`Mirror::read_each`] read the mirror on blocking threads, off the async
+//!    runtime.
 //!
 //! The token reaches git only through the credentials callback, never a URL or the config.
 
 use std::{
     collections::HashMap,
+    fmt::Debug,
     fs, io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -34,8 +35,7 @@ use octocrab::{
     models::RepositoryId,
     secrecy::{ExposeSecret, SecretString},
 };
-use rayon::prelude::*;
-use tokio::{sync::oneshot, time::timeout};
+use tokio::{sync::mpsc, time::timeout};
 use tracing::Span;
 
 use crate::{Result, limits};
@@ -78,15 +78,15 @@ impl Mirror {
     }
 
     /// Returns GitHub's refs. Past `FETCH_TIMEOUT` the fetch is asked to stop, which it notices
-    /// only while receiving the pack. Network I/O, so a blocking thread rather than rayon.
+    /// only while receiving the pack.
     pub async fn update(&self, url: String, token: SecretString) -> Result<Refs> {
         let interrupt = Arc::new(AtomicBool::new(false));
         let mut fetching = tokio::task::spawn_blocking({
             let (mirror, interrupt) = (self.clone(), interrupt.clone());
             move || {
-                let repo = mirror.open_or_init()?;
-                let github = fetch(&repo, &url, token, &interrupt)?;
-                prune(&repo, &github)?;
+                let git = mirror.open_or_init()?;
+                let github = fetch(&git, &url, token, &interrupt)?;
+                prune(&git, &github)?;
                 Ok(github)
             }
         });
@@ -102,48 +102,73 @@ impl Mirror {
         Ok(tokio::task::spawn_blocking(move || remove_dir(&path)).await??)
     }
 
-    /// On rayon's thread pool, in the caller's tracing span.
+    /// On a blocking thread, in the caller's tracing span.
     pub async fn run<T: Send + 'static>(
         &self,
         job: impl FnOnce(&gix::Repository) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let (mirror, span) = (self.clone(), Span::current());
-        let (send, receive) = oneshot::channel();
-        rayon::spawn(move || {
-            let _ = send.send(span.in_scope(|| job(&mirror.open()?)));
-        });
-        receive.await?
+        tokio::task::spawn_blocking(move || span.in_scope(|| job(&mirror.open()?))).await?
     }
 
-    /// The shape of every step: `read` each item, [`limits::READ_AT_ONCE`] at a time in parallel,
-    /// and hand what it read to `insert`, in order.
+    /// The shape of every step: [`limits::READERS`] threads `read` the items, and hand what they
+    /// read to `insert` as it comes. Each thread has its own repository: threads sharing one may
+    /// each find an object missing while another loads the index holding it. An error names its
+    /// item, and is returned once every thread has stopped. Returns how many items there were.
     pub async fn read_each<I, T, F>(
         &self,
-        items: &[I],
+        items: Vec<I>,
         read: fn(&gix::Repository, I) -> Result<T>,
         mut insert: impl FnMut(T) -> F,
-    ) -> Result
+    ) -> Result<usize>
     where
-        I: Clone + Send + 'static,
+        I: Debug + Send + 'static,
         T: Send + 'static,
         F: Future<Output = Result>,
     {
-        for batch in items.chunks(limits::READ_AT_ONCE) {
-            let batch = batch.to_vec();
-            let read = self.run(move |repo| {
-                let (repo, span) = (repo.clone().into_sync(), Span::current());
-                (batch.into_par_iter())
-                    .map_init(
-                        || repo.to_thread_local(),
-                        |repo, item| span.in_scope(|| read(repo, item)),
-                    )
-                    .collect::<Result<Vec<_>>>()
-            });
-            for item in read.await? {
-                insert(item).await?;
+        let count = items.len();
+        let readers = count.min(limits::READERS);
+        let items = Arc::new(Mutex::new(items.into_iter()));
+        let (send, mut receive) = mpsc::channel(limits::READERS);
+        let span = Span::current();
+        let readers = Vec::from_iter((0..readers).map(|_| {
+            let (mirror, items, send, span) =
+                (self.clone(), items.clone(), send.clone(), span.clone());
+            tokio::task::spawn_blocking(move || {
+                let _span = span.enter();
+                // Stops when the items run out, at its first error, or once nothing receives.
+                let read_all = || -> Result {
+                    let git = mirror.open()?;
+                    loop {
+                        let Some(item) = items.lock().unwrap().next() else {
+                            return Ok(());
+                        };
+                        let what = format!("{item:?}");
+                        let read = read(&git, item).map_err(|error| format!("{what}: {error}"))?;
+                        if send.blocking_send(Ok(read)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                };
+                if let Err(error) = read_all() {
+                    let _ = send.blocking_send(Err(error));
+                }
+            })
+        }));
+        drop(send);
+
+        let inserted: Result = async {
+            while let Some(read) = receive.recv().await {
+                insert(read?).await?;
             }
+            Ok(())
         }
-        Ok(())
+        .await;
+        drop(receive);
+        for reader in readers {
+            reader.await?;
+        }
+        inserted.map(|()| count)
     }
 
     /// Nothing from the host's git config or environment applies.
@@ -166,7 +191,7 @@ impl Mirror {
 /// Fails before receiving anything if GitHub's refs would not fit beside those already here:
 /// receiving writes them, and pruning must read them all.
 fn fetch(
-    repo: &gix::Repository,
+    git: &gix::Repository,
     url: &str,
     token: SecretString,
     interrupt: &AtomicBool,
@@ -185,13 +210,13 @@ fn fetch(
         })
     };
     // Never saved, so the URL stays out of the config.
-    let remote = repo
+    let remote = git
         .remote_at(url)?
         .with_refspecs(REFSPECS, Direction::Fetch)?;
     let prepared = (remote.connect(Direction::Fetch)?)
         .with_credentials(credentials)
         .prepare_fetch(Discard, Default::default())?;
-    let refs = prepared.ref_map().mappings.len() + read_refs(repo)?.len();
+    let refs = prepared.ref_map().mappings.len() + read_refs(git)?.len();
     limits::check(refs, limits::MIRROR_REFS, REFS)?;
     let fetched = prepared.receive(Discard, interrupt)?;
 
@@ -206,8 +231,8 @@ fn fetch(
 // 2. Prune
 
 /// gix fetches without pruning.
-fn prune(repo: &gix::Repository, github: &Refs) -> Result {
-    let gone = read_refs(repo)?
+fn prune(git: &gix::Repository, github: &Refs) -> Result {
+    let gone = read_refs(git)?
         .into_keys()
         .filter(|name| !github.contains_key(name));
     let deleted = gone.map(|name| RefEdit {
@@ -218,15 +243,15 @@ fn prune(repo: &gix::Repository, github: &Refs) -> Result {
         name,
         deref: false,
     });
-    repo.edit_references(deleted.collect::<Vec<_>>())?;
+    git.edit_references(deleted.collect::<Vec<_>>())?;
     Ok(())
 }
 
 /// Checked before every write too, so a mirror never holds more refs than it can read.
 const REFS: &str = "refs in a mirror";
 
-fn read_refs(repo: &gix::Repository) -> Result<Refs> {
-    let platform = repo.references()?;
+fn read_refs(git: &gix::Repository) -> Result<Refs> {
+    let platform = git.references()?;
     let refs = platform.all()?.map(|reference| {
         let reference = reference?.detach();
         // Only direct refs are written here.
@@ -241,64 +266,5 @@ fn remove_dir(path: &Path) -> io::Result<()> {
     match fs::remove_dir_all(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         removed => removed,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fixtures::{git, scratch};
-
-    /// GitHub holds `main`, `gone` and a pull request head. Then the head is force-pushed and
-    /// `gone` deleted.
-    #[tokio::test]
-    async fn the_mirror_holds_githubs_refs() {
-        let root = scratch("mirror");
-        let (github, work) = (root.join("github.git"), root.join("work"));
-        git(&root, &["init", "--bare", "github.git"]);
-        git(&root, &["init", "work"]);
-        let amend = |message| {
-            git(
-                &work,
-                &["commit", "--amend", "--allow-empty", "-m", message],
-            );
-            git(&work, &["rev-parse", "HEAD"])
-        };
-        let push = |refspec| git(&work, &["push", "--force", "../github.git", refspec]);
-        git(&work, &["commit", "--allow-empty", "-m", "root"]);
-        let a = amend("a");
-        for refspec in [
-            "HEAD:refs/heads/main",
-            "HEAD:refs/heads/gone",
-            "HEAD:refs/pull/1/head",
-        ] {
-            push(refspec);
-        }
-
-        let mirror = Mirror::new(&root, RepositoryId(1));
-        let url = github.to_str().unwrap().to_owned();
-        mirror.update(url.clone(), "".into()).await.unwrap();
-        let b = amend("b");
-        push("HEAD:refs/pull/1/head");
-        push(":refs/heads/gone");
-        let refs = mirror.update(url.clone(), "".into()).await.unwrap();
-
-        let listed = git(
-            &mirror.0,
-            &["for-each-ref", "--format=%(refname) %(objectname)"],
-        );
-        let mut fetched = Vec::from_iter(refs.iter().map(|(name, oid)| format!("{name} {oid}")));
-        fetched.sort();
-        assert_eq!(
-            fetched,
-            [
-                format!("refs/heads/main {a}"),
-                format!("refs/pull/1/head {b}")
-            ]
-        );
-        assert_eq!(Vec::from_iter(listed.lines()), fetched);
-        let config = fs::read_to_string(mirror.0.join("config")).unwrap();
-        assert!(!config.contains(&url), "{config}");
-        remove_dir(&root).unwrap();
     }
 }

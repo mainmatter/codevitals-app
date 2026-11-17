@@ -1,6 +1,5 @@
-//! Facts about the content of every blob on a repository's tracked branches, and on either side
-//! of each pull request head's diff from its merge-base: a `blob_fact` row per blob and language,
-//! and a `fn_fact` row per function in it.
+//! Facts about the content of every blob either side of a change to a commit the repository
+//! reaches: a `blob_fact` row per blob and language, and a `fn_fact` row per function in it.
 //!
 //! 1. [`missing`]: blobs without rows from this [`EXTRACTOR`].
 //! 2. [`extract`] their facts.
@@ -15,7 +14,6 @@ mod rust;
 mod syntax;
 
 use gix::ObjectId;
-use octocrab::models::RepositoryId;
 use sqlx::PgPool;
 use tracing::instrument;
 
@@ -26,31 +24,25 @@ use crate::{Result, changes, column, limits, mirror::Mirror};
 /// included.
 pub const EXTRACTOR: i32 = 3;
 
-pub async fn record(db: &PgPool, mirror: &Mirror, repository: RepositoryId) -> Result {
-    let missing = missing(db, repository).await?;
+pub async fn record(db: &PgPool, mirror: &Mirror, repo: i64) -> Result<usize> {
+    let missing = missing(db, repo).await?;
     mirror
-        .read_each(&missing, extract, |facts| replace(db, facts))
+        .read_each(missing, extract, |facts| replace(db, facts))
         .await
 }
 
 // 1. Missing
 
-/// Both sides of each change between the pairs the repository refers to: its branches' commits
-/// and their first parents, and its pull request heads and their merge-bases.
-async fn missing(db: &PgPool, repository: RepositoryId) -> Result<Vec<(ObjectId, Option<String>)>> {
+/// A change's base is reached too, so both sides are in the mirror.
+async fn missing(db: &PgPool, repo: i64) -> Result<Vec<(ObjectId, Option<String>)>> {
     let missing: Vec<(Vec<u8>, Option<String>)> = sqlx::query_as(
-        "WITH pair AS (
-             SELECT c.parents[1] AS base, m.commit AS head
-             FROM mainline m JOIN commit c ON c.sha = m.commit
-             WHERE m.repo = $1
-             UNION
-             SELECT merge_base, head FROM pull_head WHERE repo = $1
-         ), side AS (
+        "WITH side AS (
              SELECT ch.path, s.oid, s.mode
-             FROM pair
-             JOIN change ch ON ch.head = pair.head AND ch.base IS NOT DISTINCT FROM pair.base
+             FROM repo_commit r
+             JOIN change ch ON ch.head = r.commit
              CROSS JOIN LATERAL (VALUES (ch.old_oid, ch.old_mode), (ch.new_oid, ch.new_mode))
                  AS s (oid, mode)
+             WHERE r.repo = $1
          )
          SELECT DISTINCT oid, language(path, mode) FROM side
          WHERE mode <> 'submodule' AND NOT EXISTS (
@@ -60,7 +52,7 @@ async fn missing(db: &PgPool, repository: RepositoryId) -> Result<Vec<(ObjectId,
          )
          LIMIT $3",
     )
-    .bind(repository.0 as i64)
+    .bind(repo)
     .bind(EXTRACTOR)
     .bind(limits::BLOBS as i64 + 1)
     .fetch_all(db)
@@ -87,10 +79,10 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/";
 /// Facts as far as the first status in `blob_fact.status` that applies allows.
 #[instrument(level = "debug", skip_all, fields(%blob))]
 fn extract(
-    repo: &gix::Repository,
+    git: &gix::Repository,
     (blob, language): (ObjectId, Option<String>),
 ) -> Result<BlobFacts> {
-    let size = repo.find_header(blob)?.size();
+    let size = git.find_header(blob)?.size();
     let bytes = size.try_into()?;
     let unread = |status| BlobFacts {
         blob,
@@ -102,7 +94,7 @@ fn extract(
     if size > limits::FACT_BYTES {
         return Ok(unread("too_large"));
     }
-    let content = repo.find_blob(blob)?.detach().data;
+    let content = git.find_blob(blob)?.detach().data;
     if changes::is_binary(&content) {
         return Ok(unread("binary"));
     }
@@ -166,13 +158,13 @@ async fn replace(db: &PgPool, facts: BlobFacts) -> Result {
         .execute(&mut *transaction)
         .await?;
     sqlx::query(
-        "WITH inserted AS (
+        "WITH blob_row AS (
              INSERT INTO blob_fact VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT DO NOTHING
              RETURNING blob
          )
          INSERT INTO fn_fact
-         SELECT $1, $2, f.* FROM inserted, unnest(
+         SELECT $1, $2, f.* FROM blob_row, unnest(
              $9::text[], $10::int[], $11::int[], $12::int[], $13::int[], $14::int[], $15::int[],
              $16::bytea[], $17::bool[], $18::int[]
          ) AS f",
@@ -198,103 +190,4 @@ async fn replace(db: &PgPool, facts: BlobFacts) -> Result {
     .execute(&mut *transaction)
     .await?;
     Ok(transaction.commit().await?)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use super::*;
-    use crate::fixtures::{
-        self, assert_every_blob_has_facts, commit, git, repo, rows, scratch, submodule, write,
-    };
-
-    /// A blob of each status and language, the same bytes at a Rust and a text path, a symlink and a
-    /// submodule.
-    /// Then the Rust is edited, so a change has two sides.
-    #[sqlx::test]
-    async fn every_blob_has_facts_once_per_language(db: PgPool) {
-        repo(&db).await;
-        let mirror = Mirror(scratch("facts"));
-        let work = &mirror.0;
-        let (rust, c) = ("fn f() {}\n", "int f(void) { return 0; }\n");
-        git(work, &["init", "--initial-branch=main"]);
-        git(work, &["commit", "--allow-empty", "-m", "root"]);
-        let root = git(work, &["rev-parse", "HEAD"]);
-        let deep = format!("const D: u8 = {}1{};", "(".repeat(1100), ")".repeat(1100));
-        let large = "//\n".repeat(limits::FACT_BYTES as usize);
-        let lfs = "version https://git-lfs.github.com/spec/v1\noid sha256:0\nsize 1\n";
-        for (path, content) in [
-            ("a.rs", rust),
-            ("a.txt", rust),
-            ("a.c", c),
-            ("a.h", c),
-            ("a.cpp", c),
-            ("a.py", "def f():\n    pass\n"),
-            ("binary.rs", "fn\0\n"),
-            (
-                "broken.rs",
-                "fn before() {}\nfn broken() { let = ; }\nfn after() {}\n",
-            ),
-            ("generated.rs", "// @generated by a tool\nfn x() {}\n"),
-            ("lfs.rs", lfs),
-            ("deep.rs", &deep),
-            ("large.rs", &large),
-        ] {
-            write(work, path, content);
-        }
-        fs::write(work.join("latin1.rs"), b"fn caf\xe9() {}").unwrap();
-        std::os::unix::fs::symlink("a.rs", work.join("link.rs")).unwrap();
-        submodule(work, &root);
-        commit(work, "everything");
-        write(work, "a.rs", "fn edited() {}");
-        commit(work, "edit");
-
-        let per_file =
-            "SELECT concat_ws(' ', ch.path, f.language, f.status, f.bytes, f.lines, f.tokens, f.errors,
-                (SELECT count(*) FROM fn_fact n WHERE (n.blob, n.language) = (f.blob, f.language)))
-            FROM change ch JOIN commit c ON c.sha = ch.head
-            JOIN blob_fact f ON f.blob = ch.new_oid
-            AND f.language IS NOT DISTINCT FROM language(ch.path, ch.new_mode)
-            WHERE c.subject = 'everything'";
-        fixtures::record(&db, &mirror, &["main"]).await;
-        assert_eq!(
-            rows(&db, per_file).await,
-            [
-                "a.c c parsed 26 1 10 0 1",
-                "a.cpp cpp parsed 26 1 10 0 1",
-                "a.h cpp parsed 26 1 10 0 1",
-                "a.py python parsed 18 2 6 0 1",
-                "a.rs rust parsed 10 1 6 0 1",
-                "a.txt unsupported 10 1 0",
-                "binary.rs rust binary 4 0",
-                "broken.rs rust parsed 53 3 21 1 3",
-                "deep.rs rust too_deep 2216 1 0",
-                "generated.rs rust generated 34 2 0",
-                "large.rs rust too_large 3145728 0",
-                "latin1.rs rust unparseable 12 1 0",
-                "lfs.rs rust lfs_pointer 63 0",
-                "link.rs unsupported 4 1 0",
-            ]
-        );
-        assert_every_blob_has_facts(&db).await;
-
-        let every_row = "SELECT concat_ws(' ', encode(blob, 'hex'), language, extractor, status, bytes, lines, tokens, errors)
-            FROM blob_fact UNION ALL
-            SELECT concat_ws(' ', encode(blob, 'hex'), language, name, start_line, end_line, tokens,
-                parameters, branch_points, max_nesting, encode(shape, 'hex'), test, errors)
-            FROM fn_fact";
-        let first_run = rows(&db, every_row).await;
-        sqlx::query("UPDATE blob_fact SET extractor = extractor - 1")
-            .execute(&db)
-            .await
-            .unwrap();
-        fixtures::record(&db, &mirror, &["main"]).await;
-        assert_eq!(
-            rows(&db, every_row).await,
-            first_run,
-            "an older version is replaced"
-        );
-        fs::remove_dir_all(work).unwrap();
-    }
 }

@@ -35,7 +35,7 @@ use std::{
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    http::{Request, header::ACCEPT},
+    http::{Request, StatusCode, header::ACCEPT},
     routing::{get, post},
 };
 use clap::Parser;
@@ -43,6 +43,7 @@ use octocrab::{
     Octocrab, Page,
     models::RepositoryId,
     secrecy::{ExposeSecret, SecretString},
+    service::middleware::retry::RetryConfig,
 };
 use serde::de::DeserializeOwned;
 use sqlx::{
@@ -54,7 +55,11 @@ use tokio::{
     signal::unix::{SignalKind, signal},
     sync::Semaphore,
 };
-use tower_http::trace::{DefaultOnResponse, TraceLayer};
+use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer};
+use tower_http::{
+    timeout::TimeoutLayer,
+    trace::{DefaultOnResponse, TraceLayer},
+};
 use tracing::{Level, info, info_span};
 use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
@@ -105,11 +110,7 @@ struct App {
 }
 
 impl App {
-    fn new(config: Config, github: Octocrab, oauth: Octocrab) -> Arc<App> {
-        // A sync holds at most one connection at a time.
-        let db = PgPoolOptions::new()
-            .max_connections(limits::CONCURRENT_SYNCS as u32)
-            .connect_lazy_with(config.database.clone());
+    fn new(config: Config, github: Octocrab, oauth: Octocrab, db: PgPool) -> Arc<App> {
         Arc::new(App {
             config,
             github,
@@ -131,12 +132,15 @@ async fn main() -> Result {
     let config = Config::parse();
     mirror::prepare(&config.mirrors)?;
 
-    // octocrab waits forever by default, and one stalled request would stall all syncing.
+    // octocrab waits forever by default, and one stalled request would stall all syncing. Server
+    // and transport errors are retried at once; a rate limit fails the sync rather than holding its
+    // turn while it waits, and the next trigger tries again.
     let client = || {
         let timeout = Some(limits::GITHUB_REQUEST);
         Octocrab::builder()
             .set_connect_timeout(timeout)
             .set_read_timeout(timeout)
+            .add_retry_config(RetryConfig::Simple(limits::GITHUB_RETRIES))
     };
     let key = octocrab::EncodingKey::from_rsa_pem(config.private_key.expose_secret().as_bytes())?;
     let github = client().app(config.app_id.into(), key).build()?;
@@ -145,7 +149,11 @@ async fn main() -> Result {
         .add_header(ACCEPT, "application/json".into())
         .build()?;
 
-    let app = App::new(config, github, oauth);
+    // A sync holds at most one connection at a time.
+    let db = PgPoolOptions::new()
+        .max_connections(limits::CONCURRENT_SYNCS as u32)
+        .connect_lazy_with(config.database.clone());
+    let app = App::new(config, github, oauth, db);
     sqlx::migrate!().run(&app.db).await?;
 
     let listener = TcpListener::bind(app.config.listen).await?;
@@ -160,10 +168,19 @@ fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/setup", get(sign_in::setup))
         .route("/callback", get(sign_in::callback))
-        // axum accepts 2 MB by default.
+        // Anyone can reach it, and a body is read whole before its signature is checked. axum
+        // accepts 2 MB by default. The timeout covers waiting for a turn.
         .route(
             "/webhook",
-            post(sync::webhook).layer(DefaultBodyLimit::max(limits::WEBHOOK_BODY)),
+            post(sync::webhook).layer(
+                ServiceBuilder::new()
+                    .layer(TimeoutLayer::with_status_code(
+                        StatusCode::REQUEST_TIMEOUT,
+                        limits::WEBHOOK_TIME,
+                    ))
+                    .layer(ConcurrencyLimitLayer::new(limits::WEBHOOKS_AT_ONCE))
+                    .layer(DefaultBodyLimit::max(limits::WEBHOOK_BODY)),
+            ),
         )
         .layer(
             TraceLayer::new_for_http()
@@ -203,6 +220,24 @@ fn read_secret(path: &str) -> std::io::Result<SecretString> {
 fn tracked_branch(value: &str) -> Result<(RepositoryId, String)> {
     let (repository, branch) = value.split_once(':').ok_or("not REPOSITORY_ID:BRANCH")?;
     Ok((RepositoryId(repository.parse()?), branch.to_owned()))
+}
+
+/// Bytes git wrote, as Postgres `text`, losslessly: each byte of invalid UTF-8, and NUL, which
+/// Postgres refuses, is the code point U+10FF00 plus the byte, in a private-use plane git-written
+/// text does not use.
+fn text(bytes: &[u8]) -> String {
+    let byte = |byte: u8| char::from_u32(0x10_FF00 + u32::from(byte)).expect("a code point");
+    let mut text = String::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        text.extend(
+            chunk
+                .valid()
+                .chars()
+                .map(|c| if c == '\0' { byte(0) } else { c }),
+        );
+        text.extend(chunk.invalid().iter().map(|&invalid| byte(invalid)));
+    }
+    text
 }
 
 /// One field of each row, to bind as an array.
@@ -249,35 +284,47 @@ mod tests {
         Config::command().debug_assert();
     }
 
+    /// Signed deliveries are read for the repositories they name, whatever else they hold; one
+    /// that cannot be read is refused rather than ending the process.
     #[tokio::test]
-    async fn webhook_accepts_only_signed_deliveries() {
-        // A `ping` signed with the secret `secret`, from octocrab's documentation.
-        const PING: &str = r#"{"zen":"Design for failure.","hook_id":423885699,"hook":{"type":"App","id":423885699,"name":"web","active":true,"events":["issues"],"config":{"content_type":"json","insecure_ssl":"0","url":"https://smee.io/R"},"updated_at":"2023-07-13T09:30:45Z","created_at":"2023-07-13T09:30:45Z","app_id":360617,"deliveries_url":"https://api.github.com/app/hook/deliveries"}}"#;
-        const SIGNED: &str =
-            "sha256=f101961424ae12c9b9d55cd4e562f4040c27ff1b9a8b7d2c4ba5cfc15e62d54f";
-
-        // A ping names no repository, so GitHub is never asked.
+    async fn webhook_accepts_only_signed_readable_deliveries() {
+        // These name no repository, so GitHub is never asked.
         let github = fixtures::github(|_| async { (StatusCode::NOT_FOUND, Default::default()) });
         let router = router(fixtures::app(github));
-
+        let ping = r#"{"zen": "Design for failure.", "repositories": null}"#;
         for (signature, body, status) in [
-            (SIGNED, PING.into(), StatusCode::ACCEPTED),
-            ("", PING.into(), StatusCode::UNAUTHORIZED),
+            (sign(ping), ping, StatusCode::ACCEPTED),
+            (String::new(), ping, StatusCode::UNAUTHORIZED),
+            (sign("{}"), ping, StatusCode::UNAUTHORIZED),
             (
-                SIGNED,
-                PING.replace("failure", "success"),
-                StatusCode::UNAUTHORIZED,
+                sign(r#"{"repository": 1}"#),
+                r#"{"repository": 1}"#,
+                StatusCode::BAD_REQUEST,
             ),
         ] {
             let request = Request::post("/webhook")
-                .header("x-github-event", "ping")
                 .header("x-hub-signature-256", signature)
                 .body(Body::from(body))
                 .unwrap();
-            assert_eq!(
-                router.clone().oneshot(request).await.unwrap().status(),
-                status
-            );
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), status, "{body}");
         }
+    }
+
+    /// As GitHub signs with the secret `secret`: HMAC-SHA256.
+    fn sign(body: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let key = [&b"secret"[..], &[0; 58]].concat();
+        let pad = |byte: u8| Vec::from_iter(key.iter().map(|k| k ^ byte));
+        let inner = Sha256::new()
+            .chain_update(pad(0x36))
+            .chain_update(body)
+            .finalize();
+        let outer = Sha256::new()
+            .chain_update(pad(0x5c))
+            .chain_update(inner)
+            .finalize();
+        let hex: String = outer.iter().map(|byte| format!("{byte:02x}")).collect();
+        format!("sha256={hex}")
     }
 }

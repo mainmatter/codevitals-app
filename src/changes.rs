@@ -11,26 +11,24 @@ use std::ops::ControlFlow;
 
 use gix::{
     ObjectId,
-    bstr::ByteSlice,
     diff::blob::{Algorithm, Diff, InternedInput},
     object::tree::{EntryKind, EntryMode, diff::Change},
 };
 use sqlx::PgPool;
 
-use crate::{Result, column, limits, mirror::Mirror};
+use crate::{Result, column, limits, mirror::Mirror, text};
 
 /// `base` is diffed to `head`; a root commit has no base.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct CommitPair {
     pub base: Option<ObjectId>,
     pub head: ObjectId,
 }
 
-/// The commits of `pairs` must have rows.
-pub async fn record(db: &PgPool, mirror: &Mirror, pairs: &[CommitPair]) -> Result {
+pub async fn record(db: &PgPool, mirror: &Mirror, pairs: &[CommitPair]) -> Result<usize> {
     let missing = missing(db, pairs).await?;
     mirror
-        .read_each(&missing, diff, |diffed| insert(db, diffed))
+        .read_each(missing, diff, |diffed| insert(db, diffed))
         .await
 }
 
@@ -70,12 +68,12 @@ struct File {
 
 /// Stops once the paths of changed entries, trees included, sum past
 /// [`limits::CHANGED_PATH_BYTES`], which bounds the paths kept and the work done.
-fn diff(repo: &gix::Repository, pair: CommitPair) -> Result<(CommitPair, Vec<File>)> {
+fn diff(git: &gix::Repository, pair: CommitPair) -> Result<(CommitPair, Vec<File>)> {
     let base = match pair.base {
-        Some(base) => repo.find_commit(base)?.tree()?,
-        None => repo.empty_tree(),
+        Some(base) => git.find_commit(base)?.tree()?,
+        None => git.empty_tree(),
     };
-    let head = repo.find_commit(pair.head)?.tree()?;
+    let head = git.find_commit(pair.head)?.tree()?;
     let (mut path_bytes, mut changed) = (0, Vec::new());
     let diffed = (base.changes()?)
         .options(|options| {
@@ -106,9 +104,9 @@ fn diff(repo: &gix::Repository, pair: CommitPair) -> Result<(CommitPair, Vec<Fil
     limits::check(path_bytes, limits::CHANGED_PATH_BYTES, "changed path bytes")?;
     diffed?;
     let files = changed.into_iter().map(|(path, old, new)| {
-        let lines = count_lines(repo, old, new)?;
+        let lines = count_lines(git, old, new)?;
         Ok(File {
-            path: path.to_str()?.to_owned(),
+            path: text(&path),
             old,
             new,
             lines,
@@ -129,12 +127,14 @@ fn side(mode: EntryMode, id: gix::Id) -> Side {
     Some((id.detach(), mode))
 }
 
-/// As `git diff --numstat` counts them; none for binary files and submodules.
-fn count_lines(repo: &gix::Repository, old: Side, new: Side) -> Result<Option<(i32, i32)>> {
+/// As `git diff --numstat` counts them; none for binary files, submodules and a side over
+/// [`limits::DIFF_BYTES`].
+fn count_lines(git: &gix::Repository, old: Side, new: Side) -> Result<Option<(i32, i32)>> {
     let content = |side: Side| -> Result<Option<Vec<u8>>> {
         Ok(match side {
             Some((_, "submodule")) => None,
-            Some((oid, _)) => Some(repo.find_blob(oid)?.detach().data).filter(|c| !is_binary(c)),
+            Some((oid, _)) if git.find_header(oid)?.size() > limits::DIFF_BYTES => None,
+            Some((oid, _)) => Some(git.find_blob(oid)?.detach().data).filter(|c| !is_binary(c)),
             None => Some(Vec::new()),
         })
     };

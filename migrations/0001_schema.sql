@@ -1,10 +1,11 @@
 -- What `sync` derives from a repository's mirror and from GitHub.
 --
 -- Content (commits, the people on them, diffs, facts, the accounts of their emails) is keyed by
--- content and shared by every repository and branch that reaches it. What is per repository
--- (branches, pull requests) refers to content and goes with its `repo` row. A row is inserted whole
--- and never updated, except `repo` and a `pull` whose update time moves; `mainline` rows are
--- deleted and inserted, as are a blob's facts when the extractor changes.
+-- content and shared by every repository that reaches it; `repo_commit` says which do. What is per
+-- repository goes with its `repo` row, and `forget` deletes the content no other repository
+-- reaches. A row is inserted whole and never updated, except `repo` and a `pull` whose update time
+-- moves; `mainline` rows are deleted and inserted, as are a blob's facts when the extractor
+-- changes.
 
 -- Object ids, raw. gix hashes with SHA-1.
 CREATE DOMAIN sha AS bytea CHECK (octet_length(VALUE) = 20);
@@ -35,9 +36,21 @@ CREATE TABLE commit (
     subject text NOT NULL
 );
 
+-- Each commit a repository's tracked branches and pull request heads reach, inserted with it.
+CREATE TABLE repo_commit (
+    repo bigint NOT NULL REFERENCES repo ON DELETE CASCADE,
+    commit sha NOT NULL REFERENCES commit,
+    PRIMARY KEY (repo, commit)
+);
+
+-- `forget` asks which other repositories reach a commit.
+CREATE INDEX ON repo_commit (commit);
+
 -- Everyone on a commit, inserted with it: the one `author` and one `committer`, at 0, and each
 -- trailer whose key ends in `-by`, the key in lower case as `role`, numbered in order per role.
--- Names and emails are as git wrote them.
+-- Names and emails are as git wrote them. Like subjects and paths, text git wrote is read as
+-- UTF-8, except that each byte of invalid UTF-8, and NUL, is the code point U+10FF00 plus the
+-- byte.
 CREATE TABLE commit_person (
     commit sha NOT NULL REFERENCES commit,
     role text NOT NULL CHECK (role IN ('author', 'committer') OR role LIKE '%-by'),
@@ -57,15 +70,15 @@ CREATE DOMAIN mode AS text CHECK (VALUE IN ('file', 'executable', 'symlink', 'su
 -- pull request's merge-base and head. A root commit is diffed against nothing, `base` null. A
 -- pair's rows are inserted together; two commits with equal trees have none.
 CREATE TABLE change (
-    base sha REFERENCES commit,
-    head sha NOT NULL REFERENCES commit,
+    base sha,
+    head sha NOT NULL,
     path text NOT NULL,
     -- Null where the path is absent on that side.
     old_oid sha,
     old_mode mode,
     new_oid sha,
     new_mode mode,
-    -- Null for binary content and submodules.
+    -- Null for binary content, submodules, and a side over 8 MiB.
     lines_added int CHECK (lines_added >= 0),
     lines_deleted int CHECK (lines_deleted >= 0),
     UNIQUE NULLS NOT DISTINCT (head, base, path),
@@ -84,7 +97,7 @@ CREATE TABLE mainline (
     repo bigint NOT NULL REFERENCES repo ON DELETE CASCADE,
     branch text NOT NULL,
     seq int NOT NULL CHECK (seq >= 0),
-    commit sha NOT NULL REFERENCES commit,
+    commit sha NOT NULL,
     PRIMARY KEY (repo, branch, seq),
     UNIQUE (repo, branch, commit)
 );
@@ -148,8 +161,8 @@ CREATE TABLE pull (
 CREATE TABLE pull_head (
     repo bigint NOT NULL,
     number int NOT NULL,
-    head sha NOT NULL REFERENCES commit,
-    merge_base sha NOT NULL REFERENCES commit,
+    head sha NOT NULL,
+    merge_base sha NOT NULL,
     first_seen timestamptz NOT NULL,
     PRIMARY KEY (repo, number, head),
     FOREIGN KEY (repo, number) REFERENCES pull ON DELETE CASCADE
@@ -161,7 +174,7 @@ CREATE TABLE pull_commit (
     repo bigint NOT NULL,
     number int NOT NULL,
     head sha NOT NULL,
-    commit sha NOT NULL REFERENCES commit,
+    commit sha NOT NULL,
     position int NOT NULL CHECK (position >= 0),
     PRIMARY KEY (repo, number, head, position),
     FOREIGN KEY (repo, number, head) REFERENCES pull_head ON DELETE CASCADE
