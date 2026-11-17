@@ -1,11 +1,11 @@
-//! Records what differs between pairs of commits: one `change` row per file.
+//! Records what differs between pairs of commits: a `change` row per changed file.
 //!
-//! For each of the pairs without rows ([`missing`]), [`diff`] its trees and insert a row per
-//! changed file, with its [`lines`], in one transaction.
+//! 1. [`missing`]: the pairs without rows.
+//! 2. [`diff_pair`] each: the changed files, and how many lines changed in each.
+//! 3. [`insert`] its rows.
 //!
-//! A pair's rows depend on its content alone. No attributes or configuration apply, so they are
-//! right for every repository and branch that reaches the pair. As git does without attributes,
-//! a blob is binary if its first 8000 bytes hold a NUL.
+//! A pair's rows depend on its content alone, so they hold for every repository and branch that
+//! has the pair.
 
 use std::collections::VecDeque;
 
@@ -21,55 +21,36 @@ use gix::{
 };
 use sqlx::PgPool;
 
-use crate::{Result, limits, wait};
+use crate::{Result, column, limits, mirror::Mirror};
 
 /// `base` is diffed to `head`; a root commit has no base.
 #[derive(Clone, Copy)]
-pub struct Pair {
+pub struct CommitPair {
     pub base: Option<ObjectId>,
     pub head: ObjectId,
 }
 
-/// The commits of `pairs` must have rows. Rows are determined by their pair, so any that another
-/// sync inserts meanwhile are the same.
-pub fn record(db: &PgPool, repo: &gix::Repository, pairs: &[Pair]) -> Result {
-    for i in wait(missing(db, pairs))? {
-        let pair = pairs[i];
-        let mut transaction = wait(db.begin())?;
-        for (path, old, new) in diff(repo, pair)? {
-            let (added, deleted) = lines(repo, old, new)?.unzip();
-            let oid = |side: &Side| side.as_ref().map(|(oid, _)| oid.as_slice().to_vec());
-            let query = sqlx::query(
-                "INSERT INTO change VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(pair.base.as_ref().map(ObjectId::as_slice))
-            .bind(pair.head.as_slice())
-            .bind(path.to_str()?)
-            .bind(oid(&old))
-            .bind(old.map(|(_, mode)| mode))
-            .bind(oid(&new))
-            .bind(new.map(|(_, mode)| mode))
-            .bind(added)
-            .bind(deleted);
-            wait(query.execute(&mut *transaction))?;
+/// The commits of `pairs` must have rows.
+pub async fn record(db: &PgPool, mirror: &Mirror, pairs: &[CommitPair]) -> Result {
+    for batch in missing(db, pairs).await?.chunks(limits::BATCH) {
+        for changes in mirror.run_each(batch.to_vec(), diff_pair).await? {
+            insert(db, &changes).await?;
         }
-        wait(transaction.commit())?;
     }
     Ok(())
 }
 
 // 1. Missing
 
-/// Indices into `pairs`. A pair whose trees are equal has no rows, so it is always missing.
-async fn missing(db: &PgPool, pairs: &[Pair]) -> Result<Vec<usize>> {
+/// A pair whose trees are equal has no rows, so it is always missing.
+async fn missing(db: &PgPool, pairs: &[CommitPair]) -> Result<Vec<CommitPair>> {
     let bases: Vec<_> = pairs
         .iter()
         .map(|pair| pair.base.as_ref().map(ObjectId::as_slice))
         .collect();
     let heads: Vec<_> = pairs.iter().map(|pair| pair.head.as_slice()).collect();
-    let missing: Vec<i64> = sqlx::query_scalar(
-        "SELECT i - 1 FROM unnest($1::bytea[], $2::bytea[]) WITH ORDINALITY AS p (base, head, i)
+    let missing: Vec<(Option<Vec<u8>>, Vec<u8>)> = sqlx::query_as(
+        "SELECT p.base, p.head FROM unnest($1::bytea[], $2::bytea[]) AS p (base, head)
          WHERE NOT EXISTS (
              SELECT FROM change c WHERE c.head = p.head AND c.base IS NOT DISTINCT FROM p.base
          )",
@@ -78,28 +59,49 @@ async fn missing(db: &PgPool, pairs: &[Pair]) -> Result<Vec<usize>> {
     .bind(&heads)
     .fetch_all(db)
     .await?;
-    Ok(missing.into_iter().map(|i| i as usize).collect())
+    let pair = |(base, head): (Option<Vec<u8>>, Vec<u8>)| CommitPair {
+        base: base.as_deref().map(ObjectId::from_bytes_or_panic),
+        head: ObjectId::from_bytes_or_panic(&head),
+    };
+    Ok(missing.into_iter().map(pair).collect())
 }
 
 // 2. Diff
 
-/// A path's object and mode, named as in the schema, unless it is absent or a tree.
-type Side = Option<(ObjectId, &'static str)>;
+/// A pair's `change` rows.
+struct PairChanges {
+    pair: CommitPair,
+    files: Vec<FileChange>,
+}
 
-/// The changed files: path, old side, new side.
-fn diff(repo: &gix::Repository, pair: Pair) -> Result<Vec<(BString, Side, Side)>> {
+struct FileChange {
+    path: String,
+    old: Option<Entry>,
+    new: Option<Entry>,
+    lines_added: Option<i32>,
+    lines_deleted: Option<i32>,
+}
+
+/// A file's object and mode, named as in the schema.
+#[derive(Clone, Copy)]
+struct Entry {
+    oid: ObjectId,
+    mode: &'static str,
+}
+
+fn diff_pair(repo: &gix::Repository, pair: CommitPair) -> Result<PairChanges> {
     let base = match pair.base {
         Some(base) => repo.find_commit(base)?.tree()?,
         None => repo.empty_tree(),
     };
     let head = repo.find_commit(pair.head)?.tree()?;
-    fn iter<'a>(tree: &'a gix::Tree) -> TreeRefIter<'a> {
+    fn entries<'a>(tree: &'a gix::Tree) -> TreeRefIter<'a> {
         TreeRefIter::from_bytes(&tree.data, tree.id.kind())
     }
-    let mut changed = Changed::default();
+    let mut changed = ChangedFiles::default();
     let diffed = gix::diff::tree(
-        iter(&base),
-        iter(&head),
+        entries(&base),
+        entries(&head),
         State::default(),
         &repo.objects,
         &mut changed,
@@ -110,21 +112,33 @@ fn diff(repo: &gix::Repository, pair: Pair) -> Result<Vec<(BString, Side, Side)>
     }
     diffed?;
 
-    Ok(changed.files)
+    let mut files = Vec::new();
+    for (path, old, new) in changed.files {
+        let (lines_added, lines_deleted) = count_lines(repo, old, new)?.unzip();
+        let path = path.to_str()?.to_owned();
+        files.push(FileChange {
+            path,
+            old,
+            new,
+            lines_added,
+            lines_deleted,
+        });
+    }
+    Ok(PairChanges { pair, files })
 }
 
 /// The changed files, with paths kept as gix's `Recorder` keeps them. Stops once the paths of
-/// changed entries, trees included, sum past [`limits::CHANGED_PATH_BYTES`]. That bounds the
-/// paths kept, the subtrees queued to compare, each visited first, and the work done.
+/// changed entries, trees included, sum past [`limits::CHANGED_PATH_BYTES`], which bounds the
+/// paths kept, the subtrees queued and the work done.
 #[derive(Default)]
-struct Changed {
+struct ChangedFiles {
     path: BString,
     queued: VecDeque<BString>,
     path_bytes: usize,
-    files: Vec<(BString, Side, Side)>,
+    files: Vec<(BString, Option<Entry>, Option<Entry>)>,
 }
 
-impl Visit for Changed {
+impl Visit for ChangedFiles {
     fn pop_front_tracked_path_and_set_current(&mut self) {
         self.path = self.queued.pop_front().expect("queued with its subtree");
     }
@@ -150,18 +164,18 @@ impl Visit for Changed {
         let (old, new) = match change {
             visit::Change::Addition {
                 entry_mode, oid, ..
-            } => (None, side(entry_mode, oid)),
+            } => (None, entry(entry_mode, oid)),
             visit::Change::Deletion {
                 entry_mode, oid, ..
-            } => (side(entry_mode, oid), None),
+            } => (entry(entry_mode, oid), None),
             visit::Change::Modification {
                 previous_entry_mode,
                 previous_oid,
                 entry_mode,
                 oid,
             } => (
-                side(previous_entry_mode, previous_oid),
-                side(entry_mode, oid),
+                entry(previous_entry_mode, previous_oid),
+                entry(entry_mode, oid),
             ),
         };
         if old.is_some() || new.is_some() {
@@ -171,7 +185,8 @@ impl Visit for Changed {
     }
 }
 
-fn side(mode: EntryMode, oid: ObjectId) -> Side {
+/// Trees are not files.
+fn entry(mode: EntryMode, oid: ObjectId) -> Option<Entry> {
     let mode = match mode.kind() {
         EntryKind::Tree => return None,
         EntryKind::Blob => "file",
@@ -179,30 +194,67 @@ fn side(mode: EntryMode, oid: ObjectId) -> Side {
         EntryKind::Link => "symlink",
         EntryKind::Commit => "submodule",
     };
-    Some((oid, mode))
+    Some(Entry { oid, mode })
 }
 
-/// Added and deleted, as `git diff --numstat` counts them with Myers' algorithm, git's default;
-/// none for binary content and submodules. A blob is at most [`limits::OBJECT_BYTES`].
-fn lines(repo: &gix::Repository, old: Side, new: Side) -> Result<Option<(i32, i32)>> {
+/// Added and deleted, as `git diff --numstat` counts them; none for binary files and submodules.
+fn count_lines(
+    repo: &gix::Repository,
+    old: Option<Entry>,
+    new: Option<Entry>,
+) -> Result<Option<(i32, i32)>> {
     if [old, new]
         .iter()
-        .any(|side| matches!(side, Some((_, "submodule"))))
+        .flatten()
+        .any(|entry| entry.mode == "submodule")
     {
         return Ok(None);
     }
-    let read = |side: Side| -> Result<Vec<u8>> {
-        Ok(match side {
-            Some((oid, _)) => repo.find_blob(oid)?.detach().data,
+    let content = |entry: Option<Entry>| -> Result<Vec<u8>> {
+        Ok(match entry {
+            Some(entry) => repo.find_blob(entry.oid)?.detach().data,
             None => Vec::new(),
         })
     };
-    let (old, new) = (read(old)?, read(new)?);
-    let is_binary = |data: &[u8]| data[..data.len().min(8000)].contains(&0);
+    let (old, new) = (content(old)?, content(new)?);
     if is_binary(&old) || is_binary(&new) {
         return Ok(None);
     }
+    // Myers, git's default.
     let diff = Diff::compute(Algorithm::Myers, &InternedInput::new(&old[..], &new[..]));
-    let (added, deleted) = (diff.count_additions(), diff.count_removals());
-    Ok(Some((added.try_into()?, deleted.try_into()?)))
+    Ok(Some((
+        diff.count_additions().try_into()?,
+        diff.count_removals().try_into()?,
+    )))
+}
+
+/// As git decides without attributes: a NUL in the first 8000 bytes.
+pub fn is_binary(content: &[u8]) -> bool {
+    content[..content.len().min(8000)].contains(&0)
+}
+
+// 3. Insert
+
+async fn insert(db: &PgPool, changes: &PairChanges) -> Result {
+    let files = &changes.files;
+    let oid = |entry: Option<Entry>| entry.map(|entry| entry.oid.as_slice().to_vec());
+    let mode = |entry: Option<Entry>| entry.map(|entry| entry.mode);
+    sqlx::query(
+        "INSERT INTO change SELECT $1, $2, f.* FROM unnest(
+             $3::text[], $4::bytea[], $5::text[], $6::bytea[], $7::text[], $8::int[], $9::int[]
+         ) AS f
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(changes.pair.base.as_ref().map(ObjectId::as_slice))
+    .bind(changes.pair.head.as_slice())
+    .bind(column(files, |file| file.path.as_str()))
+    .bind(column(files, |file| oid(file.old)))
+    .bind(column(files, |file| mode(file.old)))
+    .bind(column(files, |file| oid(file.new)))
+    .bind(column(files, |file| mode(file.new)))
+    .bind(column(files, |file| file.lines_added))
+    .bind(column(files, |file| file.lines_deleted))
+    .execute(db)
+    .await?;
+    Ok(())
 }

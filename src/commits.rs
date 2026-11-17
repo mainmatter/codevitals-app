@@ -1,12 +1,11 @@
 //! Records every commit reachable from a set of tips, with everyone on it, and returns them.
 //!
-//! 1. [`reachable`]: the commits that should have a row.
-//! 2. [`missing`]: those without one.
-//! 3. [`insert`] each with its people.
+//! 1. [`reachable`]: the commits that should have rows.
+//! 2. [`missing`]: those that have none.
+//! 3. [`read_commit`] each, and [`insert`] it.
 //!
-//! A commit's people are its author, its committer, and each trailer whose key ends in `-by`, with
-//! the key in lower case as role. Names and emails are as git wrote them; text that is not UTF-8
-//! is rejected.
+//! A commit's people are its author, its committer, and each trailer whose key ends in `-by`, the
+//! key in lower case as their role. Names and emails are as git wrote them.
 
 use gix::{
     ObjectId,
@@ -14,12 +13,14 @@ use gix::{
 };
 use sqlx::PgPool;
 
-use crate::{Result, limits, wait};
+use crate::{Result, column, limits, mirror::Mirror};
 
-pub fn record(db: &PgPool, repo: &gix::Repository, tips: Vec<ObjectId>) -> Result<Vec<ObjectId>> {
-    let reachable = reachable(repo, tips)?;
-    for i in wait(missing(db, &reachable))? {
-        insert(db, repo, reachable[i])?;
+pub async fn record(db: &PgPool, mirror: &Mirror, tips: Vec<ObjectId>) -> Result<Vec<ObjectId>> {
+    let reachable = mirror.run(move |repo| reachable(repo, tips)).await?;
+    for batch in missing(db, &reachable).await?.chunks(limits::BATCH) {
+        for commit in mirror.run_each(batch.to_vec(), read_commit).await? {
+            insert(db, &commit).await?;
+        }
     }
     Ok(reachable)
 }
@@ -37,44 +38,57 @@ fn reachable(repo: &gix::Repository, tips: Vec<ObjectId>) -> Result<Vec<ObjectId
 
 // 2. Missing
 
-/// Indices into `commits`.
-async fn missing(db: &PgPool, commits: &[ObjectId]) -> Result<Vec<usize>> {
+async fn missing(db: &PgPool, commits: &[ObjectId]) -> Result<Vec<ObjectId>> {
     let shas: Vec<&[u8]> = commits.iter().map(|sha| sha.as_slice()).collect();
-    let missing: Vec<i64> = sqlx::query_scalar(
-        "SELECT i - 1 FROM unnest($1::bytea[]) WITH ORDINALITY AS c (sha, i)
+    let missing: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT c.sha FROM unnest($1::bytea[]) AS c (sha)
          WHERE NOT EXISTS (SELECT FROM commit WHERE commit.sha = c.sha)",
     )
     .bind(&shas)
     .fetch_all(db)
     .await?;
-    Ok(missing.into_iter().map(|i| i as usize).collect())
+    Ok(missing
+        .iter()
+        .map(|sha| ObjectId::from_bytes_or_panic(sha))
+        .collect())
 }
 
-// 3. Insert
+// 3. Read and insert
 
-/// One statement, so a commit and its people go in together. Rows are determined by the sha, so
-/// any that another sync inserts meanwhile are the same rows. People are bounded by the message, and
-/// that by `OBJECT_BYTES`.
-fn insert(db: &PgPool, repo: &gix::Repository, sha: ObjectId) -> Result {
+/// A `commit` row and its `commit_person` rows.
+struct Commit {
+    sha: ObjectId,
+    parents: Vec<Vec<u8>>,
+    author_time: i64,
+    author_tz: i32,
+    commit_time: i64,
+    commit_tz: i32,
+    subject: String,
+    people: Vec<Person>,
+}
+
+struct Person {
+    role: String,
+    name: String,
+    email: String,
+}
+
+fn read_commit(repo: &gix::Repository, sha: ObjectId) -> Result<Commit> {
     let object = repo.find_commit(sha)?;
     let commit = object.decode()?;
     let (author, committer) = (commit.author()?, commit.committer()?);
     let (authored, committed) = (author.time()?, committer.time()?);
-    let parents: Vec<Vec<u8>> = commit
-        .parents()
-        .map(|sha| sha.as_slice().to_vec())
-        .collect();
-
-    // Roles, names and emails, as columns, in message order.
-    let mut people: [Vec<String>; 3] = Default::default();
-    let mut add = |person: [&BStr; 3]| -> Result {
-        for (column, field) in people.iter_mut().zip(person) {
-            column.push(field.to_str()?.to_owned());
-        }
-        Ok(())
+    let person = |role: &BStr, name: &BStr, email: &BStr| -> Result<Person> {
+        Ok(Person {
+            role: role.to_str()?.to_owned(),
+            name: name.to_str()?.to_owned(),
+            email: email.to_str()?.to_owned(),
+        })
     };
-    add(["author".into(), author.name, author.email])?;
-    add(["committer".into(), committer.name, committer.email])?;
+    let mut people = vec![
+        person("author".into(), author.name, author.email)?,
+        person("committer".into(), committer.name, committer.email)?,
+    ];
     for trailer in commit
         .message()
         .body()
@@ -82,15 +96,40 @@ fn insert(db: &PgPool, repo: &gix::Repository, sha: ObjectId) -> Result {
         .flat_map(|body| body.trailers())
     {
         let role = trailer.token.to_ascii_lowercase();
-        if let Some((name, email)) = identity(&trailer.value)
-            && role.ends_with(b"-by")
+        if role.ends_with(b"-by")
+            && let Some((name, email)) = name_and_email(&trailer.value)
         {
-            add([role.as_bstr(), name, email])?;
+            people.push(person(role.as_bstr(), name, email)?);
         }
     }
-    let [roles, names, emails] = people;
+    Ok(Commit {
+        sha,
+        parents: commit
+            .parents()
+            .map(|parent| parent.as_slice().to_vec())
+            .collect(),
+        author_time: authored.seconds,
+        author_tz: authored.offset / 60,
+        commit_time: committed.seconds,
+        commit_tz: committed.offset / 60,
+        subject: commit.message().summary().to_str()?.to_owned(),
+        people,
+    })
+}
 
-    let query = sqlx::query(
+/// `Name <email>`, split as git splits its own signatures: neither part empty nor holding an angle
+/// bracket.
+fn name_and_email(value: &BStr) -> Option<(&BStr, &BStr)> {
+    let (name, email) = value.strip_suffix(b">")?.split_once_str("<")?;
+    let name = name.strip_suffix(b" ").unwrap_or(name);
+    let valid = |part: &[u8]| !part.is_empty() && !part.contains(&b'<') && !part.contains(&b'>');
+    (valid(name) && valid(email)).then(|| (name.as_bstr(), email.as_bstr()))
+}
+
+/// One statement, so a commit and its people go in together.
+async fn insert(db: &PgPool, commit: &Commit) -> Result {
+    let people = &commit.people;
+    sqlx::query(
         "WITH commit AS (
              INSERT INTO commit (sha, parents, author_time, author_tz, commit_time, commit_tz, subject)
              VALUES ($1, $2::sha[], to_timestamp($3::int8), $4, to_timestamp($5::int8), $6, $7)
@@ -101,27 +140,19 @@ fn insert(db: &PgPool, repo: &gix::Repository, sha: ObjectId) -> Result {
          FROM unnest($8::text[], $9::text[], $10::text[]) WITH ORDINALITY AS p (role, name, email, n)
          ON CONFLICT DO NOTHING",
     )
-    .bind(sha.as_slice())
-    .bind(&parents)
-    .bind(authored.seconds)
-    .bind(authored.offset / 60)
-    .bind(committed.seconds)
-    .bind(committed.offset / 60)
-    .bind(commit.message().summary().to_str()?)
-    .bind(roles)
-    .bind(names)
-    .bind(emails);
-    wait(query.execute(db))?;
+    .bind(commit.sha.as_slice())
+    .bind(&commit.parents)
+    .bind(commit.author_time)
+    .bind(commit.author_tz)
+    .bind(commit.commit_time)
+    .bind(commit.commit_tz)
+    .bind(&commit.subject)
+    .bind(column(people, |person| person.role.as_str()))
+    .bind(column(people, |person| person.name.as_str()))
+    .bind(column(people, |person| person.email.as_str()))
+    .execute(db)
+    .await?;
     Ok(())
-}
-
-/// `Name <email>`, split as git splits its own signatures, neither part empty nor holding an
-/// angle bracket.
-fn identity(value: &BStr) -> Option<(&BStr, &BStr)> {
-    let (name, email) = value.strip_suffix(b">")?.split_once_str("<")?;
-    let name = name.strip_suffix(b" ").unwrap_or(name);
-    let valid = |part: &[u8]| !part.is_empty() && !part.contains(&b'<') && !part.contains(&b'>');
-    (valid(name) && valid(email)).then(|| (name.as_bstr(), email.as_bstr()))
 }
 
 #[cfg(test)]
@@ -129,16 +160,16 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::checkout::{
-        Checkout,
-        tests::{git, scratch},
+    use crate::{
+        fixtures::{git, rows, scratch},
+        mirror::Mirror,
     };
 
     /// `main` holds a root commit, then a merge of a commit naming people in trailers.
     #[sqlx::test]
     async fn every_person_on_every_reachable_commit_is_recorded_once(db: PgPool) {
-        let checkout = Checkout(scratch("commits"));
-        let work = &checkout.0;
+        let mirror = Mirror(scratch("commits"));
+        let work = &mirror.0;
         let author = "--author=Ada <ada@example.com>";
         for args in [
             &["init", "--initial-branch=main"][..],
@@ -152,23 +183,11 @@ mod tests {
         }
         let main: ObjectId = git(work, &["rev-parse", "main"]).parse().unwrap();
 
-        let rows = async || {
-            let mut rows: Vec<String> = sqlx::query_scalar(
-                "SELECT format('%s %s: %s %s %s <%s>', subject, author_tz, role, position, name, email)
-                 FROM commit JOIN commit_person ON commit = sha",
-            )
-            .fetch_all(&db)
-            .await
-            .unwrap();
-            rows.sort();
-            rows
-        };
-        let record = || {
-            let db = db.clone();
-            checkout.read(move |repo| record(&db, repo, vec![main]))
-        };
-        record().await.unwrap();
-        let recorded = rows().await;
+        let people =
+            "SELECT format('%s %s: %s %s %s <%s>', subject, author_tz, role, position, name, email)
+            FROM commit JOIN commit_person ON commit = sha";
+        record(&db, &mirror, vec![main]).await.unwrap();
+        let recorded = rows(&db, people).await;
         assert_eq!(
             recorded,
             [
@@ -184,8 +203,8 @@ mod tests {
                 "root 330: committer 0 A <a@example.com>",
             ]
         );
-        record().await.unwrap();
-        assert_eq!(rows().await, recorded);
+        record(&db, &mirror, vec![main]).await.unwrap();
+        assert_eq!(rows(&db, people).await, recorded);
         fs::remove_dir_all(work).unwrap();
     }
 

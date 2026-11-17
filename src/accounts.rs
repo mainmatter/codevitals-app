@@ -19,7 +19,7 @@ use sqlx::PgPool;
 
 use crate::{Result, limits};
 
-/// `commits` must be in the checkout of `full_name`.
+/// `commits` must be in the repository `full_name`.
 pub async fn record(
     github: &Octocrab,
     db: &PgPool,
@@ -27,7 +27,7 @@ pub async fn record(
     commits: &[ObjectId],
 ) -> Result {
     for batch in unasked(db, commits).await?.chunks(limits::EMAILS_PER_QUERY) {
-        let mut accounts = ask(github, full_name, batch.iter().map(|(_, commit)| commit)).await?;
+        let mut accounts = ask(github, full_name, batch).await?;
         for (email, _) in batch {
             insert(db, email, accounts.remove(email).flatten()).await?;
         }
@@ -65,11 +65,12 @@ struct Account {
     login: String,
 }
 
-/// By lowercased email. `authors` holds the author and each co-author GitHub parsed.
+/// About the commit of each `(email, commit)`. By lowercased email; `authors` holds the author and
+/// each co-author GitHub parsed.
 async fn ask(
     github: &Octocrab,
     full_name: &str,
-    commits: impl ExactSizeIterator<Item = &ObjectId>,
+    unasked: &[(String, ObjectId)],
 ) -> Result<HashMap<String, Option<Account>>> {
     /// A `null` or a non-commit object fails to parse.
     #[derive(Deserialize)]
@@ -93,11 +94,10 @@ async fn ask(
         user: Option<Account>,
     }
 
-    let asked = commits.len();
     const ACTOR: &str = "email user { databaseId login }";
     let max = limits::AUTHORS_PER_COMMIT;
-    let objects: String = (commits.enumerate())
-        .map(|(i, commit)| {
+    let objects: String = (unasked.iter().enumerate())
+        .map(|(i, (_, commit))| {
             format!(
                 "c{i}: object(oid: \"{commit}\") {{ ... on Commit {{
                      authors(first: {max}) {{ totalCount nodes {{ {ACTOR} }} }}
@@ -119,7 +119,7 @@ async fn ask(
     });
     let data: Data = github.graphql(&request).await?;
 
-    if data.repository.len() != asked {
+    if data.repository.len() != unasked.len() {
         return Err("an answer missing a commit asked about".into());
     }
     let mut accounts = HashMap::new();
@@ -168,39 +168,26 @@ mod tests {
 
     use super::*;
     use crate::{
-        checkout::{
-            Checkout,
-            tests::{git, scratch},
-        },
-        commits, sync,
+        commits,
+        fixtures::{git, github, rows, scratch},
+        mirror::Mirror,
     };
 
     /// Ada commits from work, then from elsewhere with Ada from home as co-author. Work and home
     /// are her account's emails; elsewhere is another Ada, unknown to GitHub.
     #[sqlx::test]
     async fn a_person_is_their_account_not_their_name(db: PgPool) {
-        let checkout = Checkout(scratch("accounts"));
-        let work = &checkout.0;
-        for args in [
-            &["init", "--initial-branch=main"][..],
-            &[
-                "commit",
-                "--allow-empty",
-                "--author=Ada <ada@work.example>",
-                "-m",
-                "1",
-            ],
-            &[
-                "commit",
-                "--allow-empty",
-                "--author=Ada <ada@elsewhere.example>",
-                "--trailer=Co-authored-by: Ada <ADA@home.example>",
-                "-m",
-                "2",
-            ],
-        ] {
-            git(work, args);
-        }
+        let mirror = Mirror(scratch("accounts"));
+        let work = &mirror.0;
+        let at_work = "--author=Ada <ada@work.example>";
+        let elsewhere = "--author=Ada <ada@elsewhere.example>";
+        let home = "--trailer=Co-authored-by: Ada <ADA@home.example>";
+        git(work, &["init", "--initial-branch=main"]);
+        git(work, &["commit", "--allow-empty", at_work, "-m", "1"]);
+        git(
+            work,
+            &["commit", "--allow-empty", "-m", "2", elsewhere, home],
+        );
         let tip: ObjectId = git(work, &["rev-parse", "main"]).parse().unwrap();
         let first = git(work, &["rev-parse", "main~"]);
 
@@ -224,7 +211,7 @@ mod tests {
         ]);
         let queries = Arc::new(AtomicUsize::new(0));
         let counted = queries.clone();
-        let github = sync::tests::github(move |request| {
+        let github = github(move |request| {
             counted.fetch_add(1, Ordering::SeqCst);
             let github_commits = github_commits.clone();
             async move {
@@ -244,23 +231,16 @@ mod tests {
         });
 
         for _ in 0..2 {
-            let pool = db.clone();
-            let read = checkout.read(move |repo| commits::record(&pool, repo, vec![tip]));
-            let commits = read.await.unwrap();
+            let commits = commits::record(&db, &mirror, vec![tip]).await.unwrap();
             record(&github, &db, "o/r", &commits).await.unwrap();
         }
         // Four emails, one query; none left to ask the second time.
         assert_eq!(queries.load(Ordering::SeqCst), 1);
 
-        let persons: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT format('%s %s <%s>: %s', role, name, email, person)
-             FROM commit_person_key ORDER BY 1",
-        )
-        .fetch_all(&db)
-        .await
-        .unwrap();
+        let persons = "SELECT DISTINCT format('%s %s <%s>: %s', role, name, email, person)
+            FROM commit_person_key";
         assert_eq!(
-            persons,
+            rows(&db, persons).await,
             [
                 "author Ada <ada@elsewhere.example>: email:ada@elsewhere.example",
                 "author Ada <ada@work.example>: account:1",

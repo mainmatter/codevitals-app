@@ -11,10 +11,13 @@
 mod accounts;
 mod app;
 mod changes;
-mod checkout;
 mod commits;
+mod facts;
+#[cfg(test)]
+mod fixtures;
 mod limits;
 mod mainline;
+mod mirror;
 mod sign_in;
 mod sync;
 
@@ -51,7 +54,7 @@ use tokio::{
 };
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::{Level, info, info_span};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
 pub type Result<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -64,9 +67,9 @@ struct Config {
     /// Postgres, e.g. `postgres:///cv?host=/run/postgresql`.
     #[arg(long = "database-url", value_name = "URL")]
     database: PgConnectOptions,
-    /// Directory for a bare git checkout of each repository. Made readable by this user only.
-    #[arg(long = "checkout-dir", value_name = "DIR")]
-    checkouts: PathBuf,
+    /// Directory for a bare git mirror of each repository. Made readable by this user only.
+    #[arg(long = "mirror-dir", value_name = "DIR")]
+    mirrors: PathBuf,
     /// A branch to track besides the repository's default branch. Repeatable.
     #[arg(long = "tracked-branch", value_name = "REPOSITORY_ID:BRANCH", value_parser = tracked_branch)]
     tracked_branches: Vec<(RepositoryId, String)>,
@@ -120,9 +123,11 @@ impl App {
 async fn main() -> Result {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        // A span's duration, when it closes: requests, syncs, and at `debug` each blob's facts.
+        .with_span_events(FmtSpan::CLOSE)
         .init();
     let config = Config::parse();
-    checkout::prepare(&config.checkouts)?;
+    mirror::prepare(&config.mirrors)?;
 
     // octocrab waits forever by default, and one stalled request would stall all syncing.
     let client = || {
@@ -198,9 +203,9 @@ fn tracked_branch(value: &str) -> Result<(RepositoryId, String)> {
     Ok((RepositoryId(repository.parse()?), branch.to_owned()))
 }
 
-/// Runs `future` from blocking code, as [`checkout::Checkout::read`] runs sync's git work.
-fn wait<F: Future>(future: F) -> F::Output {
-    tokio::runtime::Handle::current().block_on(future)
+/// One field of each row, to bind as an array.
+fn column<'r, R, T>(rows: &'r [R], field: impl Fn(&'r R) -> T) -> Vec<T> {
+    rows.iter().map(field).collect()
 }
 
 /// Every item of GitHub's list at `path`. Fails past `limit` items.
@@ -243,8 +248,8 @@ mod tests {
             "sha256=f101961424ae12c9b9d55cd4e562f4040c27ff1b9a8b7d2c4ba5cfc15e62d54f";
 
         // A ping names no repository, so GitHub is never asked.
-        let github = sync::tests::github(|_| async { (StatusCode::NOT_FOUND, Default::default()) });
-        let router = router(sync::tests::app(github));
+        let github = fixtures::github(|_| async { (StatusCode::NOT_FOUND, Default::default()) });
+        let router = router(fixtures::app(github));
 
         for (signature, body, status) in [
             (SIGNED, PING.into(), StatusCode::ACCEPTED),

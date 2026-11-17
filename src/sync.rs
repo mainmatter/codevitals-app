@@ -19,7 +19,7 @@ use axum::{
 use octocrab::{
     Octocrab,
     models::{
-        Installation, InstallationId, Repository, RepositoryId,
+        Installation, Repository, RepositoryId,
         webhook_events::{WebhookEvent, WebhookEventPayload, verification::verify_signature},
     },
     secrecy::ExposeSecret,
@@ -87,20 +87,16 @@ async fn schedule_all(app: &Arc<App>) -> Result {
     let installations: Vec<Installation> =
         list(&app.github, "/app/installations", limits::INSTALLATIONS).await?;
     for installation in installations {
+        let scheduled = async {
+            let github = app.github.installation(installation.id)?;
+            let repositories: Vec<Repository> =
+                list(&github, "/installation/repositories", limits::REPOSITORIES).await?;
+            repositories.iter().try_for_each(|r| schedule(app, r.id))
+        };
         // One at a time, so that a suspended installation does not hold up the others.
-        if let Err(error) = schedule_installation(app, installation.id).await {
+        if let Err(error) = scheduled.await {
             warn!(installation = installation.id.0, %error, "resync failed");
         }
-    }
-    Ok(())
-}
-
-async fn schedule_installation(app: &Arc<App>, installation: InstallationId) -> Result {
-    let github = app.github.installation(installation)?;
-    let repositories: Vec<Repository> =
-        list(&github, "/installation/repositories", limits::REPOSITORIES).await?;
-    for repository in repositories {
-        schedule(app, repository.id)?;
     }
     Ok(())
 }
@@ -176,21 +172,14 @@ async fn context(github: &Octocrab, repository: RepositoryId) -> Result<Option<a
 }
 
 #[cfg(test)]
-pub mod tests {
-    use std::{
-        convert::Infallible,
-        sync::atomic::{AtomicUsize, Ordering},
-    };
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use axum::http::{Request, Response, Uri};
-    use octocrab::{
-        AuthState, OctoBody, OctocrabBuilder, service::middleware::base_uri::BaseUriLayer,
-    };
-    use serde_json::{Value, json};
+    use serde_json::json;
     use tokio::sync::Semaphore;
-    use tower::service_fn;
 
     use super::*;
+    use crate::fixtures::{app, github};
 
     /// GitHub counts each request and holds it until released, then fails it: each sync ends at
     /// its first request.
@@ -213,45 +202,6 @@ pub mod tests {
         release.add_permits(10);
         settle().await;
         assert_eq!(requests.load(Ordering::SeqCst), 2);
-    }
-
-    /// Acting as `github`, with a database it never reaches.
-    pub fn app(github: Octocrab) -> Arc<App> {
-        let config = crate::Config {
-            listen: ([127, 0, 0, 1], 0).into(),
-            database: "postgres://unused".parse().unwrap(),
-            checkouts: "/unused".into(),
-            tracked_branches: Vec::new(),
-            app_id: 1,
-            client_id: "unused".into(),
-            private_key: "unused".into(),
-            client_secret: "unused".into(),
-            webhook_secret: "secret".into(),
-        };
-        App::new(config, github.clone(), github)
-    }
-
-    /// GitHub at `http://github.test`, answering every request with `answer`.
-    pub fn github<A>(
-        answer: impl Fn(Request<OctoBody>) -> A + Clone + Send + Sync + 'static,
-    ) -> Octocrab
-    where
-        A: Future<Output = (StatusCode, Value)> + Send + 'static,
-    {
-        let service = service_fn(move |request| {
-            let answered = answer(request);
-            async move {
-                let (status, body) = answered.await;
-                let response = Response::builder().status(status);
-                Ok::<_, Infallible>(response.body(body.to_string()).unwrap())
-            }
-        });
-        OctocrabBuilder::new_empty()
-            .with_service(service)
-            .with_layer(&BaseUriLayer::new(Uri::from_static("http://github.test")))
-            .with_auth(AuthState::None)
-            .build()
-            .unwrap()
     }
 
     /// Runs every other task until it waits. Tests run on one thread.

@@ -1,4 +1,4 @@
-//! Every bound. Exceeding one is an error.
+//! Every bound. Exceeding one is an error, except for a blob's facts: its status says so instead.
 
 use std::time::Duration;
 
@@ -15,8 +15,8 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// As GitHub reports it, before fetching: there is no limit on the pack itself.
 pub const REPOSITORY_KB: u32 = 10 << 20;
-/// Refs in a checkout.
-pub const CHECKOUT_REFS: usize = 500_000;
+/// Refs in a mirror.
+pub const MIRROR_REFS: usize = 500_000;
 /// The largest single allocation while reading a fetched pack: an object, or a delta's result.
 pub const OBJECT_BYTES: usize = 512 << 20;
 
@@ -30,3 +30,12 @@ pub const AUTHORS_PER_COMMIT: usize = 100;
 
 /// The paths of entries that differ between two commits, trees included, summed.
 pub const CHANGED_PATH_BYTES: usize = 64 << 20;
+
+/// Blobs without facts, on one repository's tracked branches.
+pub const BLOBS: usize = 10_000_000;
+/// Items read in one job.
+pub const BATCH: usize = 1_000;
+/// A larger blob is `too_large`.
+pub const FACT_BYTES: u64 = 1 << 20;
+/// A deeper syntax tree is `too_deep`.
+pub const SYNTAX_DEPTH: usize = 1_000;

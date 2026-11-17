@@ -57,7 +57,7 @@
               ];
             };
             strictDeps = true;
-            # Git serves the checkout tests' fixture repository.
+            # Git serves the mirror tests' fixture repository.
             nativeCheckInputs = [
               pkgs.git
               pkgs.postgresql_18

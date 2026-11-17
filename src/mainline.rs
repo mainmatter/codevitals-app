@@ -1,15 +1,14 @@
 //! Each tracked branch's first-parent history, as `mainline` rows, and its changes.
 //!
-//! Rows of branches no longer tracked are deleted. Then, for each tracked branch whose rows do
-//! not end at its tip:
+//! Rows of branches no longer tracked are deleted. Then, for each tracked branch whose rows do not
+//! end at its tip:
 //!
-//! 1. [`first_parents`]: its line from root to tip.
-//! 2. [`changes::record`] each commit on the line against its first parent.
-//! 3. [`replace`] its rows with the line, in one transaction.
+//! 1. [`first_parents`]: its line from the root to the tip.
+//! 2. [`changes::record`] each commit on it against its first parent.
+//! 3. [`replace`] its rows with the line.
 //!
-//! Rows are replaced whole, never patched, so a force-push is no special case and readers see the
-//! old line or the new one. Changes are keyed by content, so a replaced line diffs only commits
-//! it has not seen.
+//! A tip determines its line, so rows ending at the tip are already the line. Rows are replaced
+//! whole, so a force-push is no special case and readers see the old line or the new one.
 
 use gix::ObjectId;
 use octocrab::models::RepositoryId;
@@ -17,51 +16,55 @@ use sqlx::PgPool;
 
 use crate::{
     Result,
-    changes::{self, Pair},
-    limits, wait,
+    changes::{self, CommitPair},
+    limits,
+    mirror::Mirror,
 };
 
-/// `tips` holds each tracked branch the repository has; their commits must have rows.
-pub fn record(
+/// The commits of `branches` must have rows.
+pub async fn record(
     db: &PgPool,
-    repo: &gix::Repository,
+    mirror: &Mirror,
     repository: RepositoryId,
-    tips: &[(String, ObjectId)],
+    branches: &[(String, ObjectId)],
 ) -> Result {
     let repository = repository.0 as i64;
-    let branches: Vec<&str> = tips.iter().map(|(branch, _)| branch.as_str()).collect();
-    let untracked = sqlx::query("DELETE FROM mainline WHERE repo = $1 AND branch <> ALL($2)")
+    let names: Vec<&str> = branches.iter().map(|(name, _)| name.as_str()).collect();
+    sqlx::query("DELETE FROM mainline WHERE repo = $1 AND branch <> ALL($2)")
         .bind(repository)
-        .bind(&branches);
-    wait(untracked.execute(db))?;
+        .bind(&names)
+        .execute(db)
+        .await?;
 
-    for (branch, tip) in tips {
-        let last = sqlx::query_scalar(
+    for (branch, tip) in branches {
+        let last: Option<Vec<u8>> = sqlx::query_scalar(
             "SELECT commit FROM mainline WHERE repo = $1 AND branch = $2 ORDER BY seq DESC LIMIT 1",
         )
         .bind(repository)
-        .bind(branch);
-        let last: Option<Vec<u8>> = wait(last.fetch_optional(db))?;
+        .bind(branch)
+        .fetch_optional(db)
+        .await?;
         if last.as_deref() == Some(tip.as_slice()) {
             continue;
         }
-        let line = first_parents(repo, *tip)?;
-        changes::record(db, repo, &line)?;
-        wait(replace(db, repository, branch, &line))?;
+        let tip = *tip;
+        let line = mirror.run(move |repo| first_parents(repo, tip)).await?;
+        changes::record(db, mirror, &line).await?;
+        replace(db, repository, branch, &line).await?;
     }
     Ok(())
 }
 
 /// From the root to `tip`, each commit paired with its first parent.
-fn first_parents(repo: &gix::Repository, tip: ObjectId) -> Result<Vec<Pair>> {
+fn first_parents(repo: &gix::Repository, tip: ObjectId) -> Result<Vec<CommitPair>> {
     let walk = repo.rev_walk([tip]).first_parent_only().all()?;
     let mut line = Vec::new();
-    for info in walk.take(limits::COMMITS + 1) {
-        let info = info?;
-        let base = info.parent_ids.first().copied();
-        line.push(Pair {
+    for commit in walk.take(limits::COMMITS + 1) {
+        let commit = commit?;
+        let base = commit.parent_ids.first().copied();
+        line.push(CommitPair {
             base,
-            head: info.id,
+            head: commit.id,
         });
     }
     if line.len() > limits::COMMITS {
@@ -72,7 +75,8 @@ fn first_parents(repo: &gix::Repository, tip: ObjectId) -> Result<Vec<Pair>> {
     Ok(line)
 }
 
-async fn replace(db: &PgPool, repository: i64, branch: &str, line: &[Pair]) -> Result {
+/// One transaction.
+async fn replace(db: &PgPool, repository: i64, branch: &str, line: &[CommitPair]) -> Result {
     let commits: Vec<&[u8]> = line.iter().map(|pair| pair.head.as_slice()).collect();
     let mut transaction = db.begin().await?;
     sqlx::query("DELETE FROM mainline WHERE repo = $1 AND branch = $2")
@@ -94,30 +98,23 @@ async fn replace(db: &PgPool, repository: i64, branch: &str, line: &[Pair]) -> R
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, fs, os::unix::fs::PermissionsExt, path::Path};
+    use std::{collections::BTreeSet, fs, os::unix::fs::PermissionsExt};
 
     use super::*;
     use crate::{
-        checkout::{
-            Checkout,
-            tests::{git, scratch},
-        },
         commits,
+        fixtures::{commit, git, repo, rows, scratch, submodule, write},
     };
 
     const REPOSITORY: RepositoryId = RepositoryId(1);
 
-    /// `main` and `side` go through ordinary pushes, an amended tip, replaced commits, a
-    /// fast-forward that reroutes `main`'s first-parent line, and unrelated history. Then `side`
-    /// is no longer tracked.
+    /// `main` and `side` go through ordinary pushes, replaced commits, a fast-forward that reroutes
+    /// `main`'s first-parent line, and unrelated history. Then `side` is no longer tracked.
     #[sqlx::test]
     async fn every_seq_holds_what_git_lists(db: PgPool) {
-        sqlx::query("INSERT INTO repo VALUES (1, 'o/r')")
-            .execute(&db)
-            .await
-            .unwrap();
-        let checkout = Checkout(scratch("mainline"));
-        let work = &checkout.0;
+        repo(&db).await;
+        let mirror = Mirror(scratch("mainline"));
+        let work = &mirror.0;
         let both = ["main", "side"];
 
         // Ordinary pushes: every kind of entry, a mode change, a directory replaced by a file, an
@@ -148,20 +145,15 @@ mod tests {
         commit(work, "side");
         git(work, &["switch", "main"]);
         git(work, &["merge", "--no-ff", "-m", "merge side", "side"]);
-        sync_and_check(&db, &checkout, &both).await;
+        sync_and_check(&db, &mirror, &both).await;
 
-        // An amended tip.
-        write(work, "a.txt", "amended\n");
-        git(work, &["commit", "--amend", "-a", "-m", "amended merge"]);
-        sync_and_check(&db, &checkout, &both).await;
-
-        // Replaced commits.
+        // Replaced commits, the tip among them.
         git(work, &["reset", "--hard", "HEAD~2"]);
         write(work, "a.txt", "replaced\n");
         commit(work, "replaced 1");
         write(work, "c.txt", "c\n");
         commit(work, "replaced 2");
-        sync_and_check(&db, &checkout, &both).await;
+        sync_and_check(&db, &mirror, &both).await;
 
         // `side` merges `main`, then `main` fast-forwards to it: `main`'s first parents now run
         // through `side`.
@@ -171,111 +163,80 @@ mod tests {
         git(work, &["merge", "--no-ff", "-m", "merge main", "main"]);
         git(work, &["switch", "main"]);
         git(work, &["merge", "--ff-only", "side"]);
-        sync_and_check(&db, &checkout, &both).await;
+        sync_and_check(&db, &mirror, &both).await;
 
         // Unrelated history.
         git(work, &["switch", "--orphan", "unrelated"]);
         write(work, "new.txt", "new\n");
         commit(work, "unrelated");
         git(work, &["branch", "--force", "main", "unrelated"]);
-        sync_and_check(&db, &checkout, &both).await;
+        sync_and_check(&db, &mirror, &both).await;
 
-        sync_and_check(&db, &checkout, &["main"]).await;
-        let side = rows(&db, "SELECT branch FROM mainline WHERE branch = $1", "side");
+        sync_and_check(&db, &mirror, &["main"]).await;
+        let side = rows(&db, "SELECT branch FROM mainline WHERE branch = 'side'");
         assert!(side.await.is_empty());
         fs::remove_dir_all(work).unwrap();
     }
 
-    async fn sync_and_check(db: &PgPool, checkout: &Checkout, branches: &[&str]) {
-        let work = &checkout.0;
-        let tips: Vec<(String, ObjectId)> = (branches.iter())
-            .map(|&branch| {
-                (
-                    branch.into(),
-                    git(work, &["rev-parse", branch]).parse().unwrap(),
-                )
-            })
+    async fn sync_and_check(db: &PgPool, mirror: &Mirror, names: &[&str]) {
+        let work = &mirror.0;
+        let tip = |name: &str| git(work, &["rev-parse", name]).parse().unwrap();
+        let branches: Vec<(String, ObjectId)> = names
+            .iter()
+            .map(|&name| (name.to_owned(), tip(name)))
             .collect();
-        let pool = db.clone();
-        let read = checkout.read(move |repo| {
-            commits::record(&pool, repo, tips.iter().map(|(_, tip)| *tip).collect())?;
-            record(&pool, repo, REPOSITORY, &tips)
-        });
-        read.await.unwrap();
+        let tips = branches.iter().map(|(_, tip)| *tip).collect();
+        commits::record(db, mirror, tips).await.unwrap();
+        record(db, mirror, REPOSITORY, &branches).await.unwrap();
 
-        for &branch in branches {
+        let sorted = |lines: Vec<String>| Vec::from_iter(BTreeSet::from_iter(lines));
+        for &branch in names {
             let line = git(work, &["rev-list", "--first-parent", "--reverse", branch]);
             let line: Vec<&str> = line.lines().collect();
 
-            let mainline = rows(
-                db,
-                "SELECT seq || ' ' || encode(commit, 'hex') FROM mainline WHERE branch = $1",
-                branch,
+            let mainline = format!(
+                "SELECT seq || ' ' || encode(commit, 'hex') FROM mainline WHERE branch = '{branch}'"
             );
-            let listed = line
-                .iter()
-                .enumerate()
-                .map(|(seq, commit)| format!("{seq} {commit}"));
-            assert_eq!(mainline.await, listed.collect(), "{branch}");
+            let listed = line.iter().enumerate();
+            let listed = listed.map(|(seq, commit)| format!("{seq} {commit}"));
+            assert_eq!(rows(db, &mainline).await, sorted(listed.collect()));
 
-            let tree = "SELECT concat_ws(' ', encode(commit, 'hex'),
+            let tree = format!(
+                "SELECT concat_ws(' ', encode(commit, 'hex'),
                     CASE mode WHEN 'file' THEN '100644' WHEN 'executable' THEN '100755'
                         WHEN 'symlink' THEN '120000' ELSE '160000' END,
                     encode(oid, 'hex'), path)
-                FROM tree JOIN mainline m USING (repo, branch) WHERE branch = $1 AND seqs @> m.seq";
+                FROM tree JOIN mainline m USING (repo, branch)
+                WHERE branch = '{branch}' AND seqs @> m.seq"
+            );
             let listed = line.iter().flat_map(|commit| {
                 let format = format!("--format={commit} %(objectmode) %(objectname) %(path)");
                 let listed = git(work, &["ls-tree", "-r", &format, commit]);
                 listed.lines().map(String::from).collect::<Vec<_>>()
             });
-            assert_eq!(rows(db, tree, branch).await, listed.collect(), "{branch}");
+            assert_eq!(rows(db, &tree).await, sorted(listed.collect()));
 
             // Without submodules, whose `Subproject commit` lines git counts.
-            let counted = "SELECT concat_ws(E'\\t', encode(head, 'hex'),
+            let counted = format!(
+                "SELECT concat_ws(E'\\t', encode(head, 'hex'),
                     coalesce(lines_added::text, '-'), coalesce(lines_deleted::text, '-'), path)
                 FROM mainline JOIN commit ON sha = commit
                 JOIN change ON head = commit AND base IS NOT DISTINCT FROM parents[1]
-                WHERE branch = $1 AND 'submodule' NOT IN (coalesce(old_mode, ''), coalesce(new_mode, ''))";
-            let log = git(
-                work,
-                &["log", "--first-parent", "--numstat", "--format=%H", branch],
+                WHERE branch = '{branch}'
+                AND 'submodule' NOT IN (coalesce(old_mode, ''), coalesce(new_mode, ''))"
             );
-            let (mut commit, mut numstat) = ("", BTreeSet::new());
-            for line in log
-                .lines()
-                .filter(|line| !line.is_empty() && !line.ends_with("\tsub"))
-            {
-                if line.contains('\t') {
-                    numstat.insert(format!("{commit}\t{line}"));
-                } else {
-                    commit = line;
+            let log = ["log", "--first-parent", "--numstat", "--format=%H", branch];
+            let (mut commit, mut numstat) = ("", Vec::new());
+            for line in git(work, &log).lines() {
+                match line.split_once('\t') {
+                    Some(_) if !line.ends_with("\tsub") => {
+                        numstat.push(format!("{commit}\t{line}"))
+                    }
+                    None if !line.is_empty() => commit = line,
+                    _ => {}
                 }
             }
-            assert_eq!(rows(db, counted, branch).await, numstat, "{branch}");
+            assert_eq!(rows(db, &counted).await, sorted(numstat));
         }
-    }
-
-    fn write(work: &Path, path: &str, content: &str) {
-        let path = work.join(path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, content).unwrap();
-    }
-
-    fn submodule(work: &Path, commit: &str) {
-        let info = format!("160000,{commit},sub");
-        git(work, &["update-index", "--add", "--cacheinfo", &info]);
-    }
-
-    /// Stages every file, but not the deletion of `sub`, which has no directory.
-    fn commit(work: &Path, message: &str) {
-        git(work, &["add", "--all", "--", ".", ":!sub"]);
-        git(work, &["commit", "-m", message]);
-    }
-
-    async fn rows(db: &PgPool, sql: &str, branch: &str) -> BTreeSet<String> {
-        let rows = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-            .bind(branch)
-            .fetch_all(db);
-        rows.await.unwrap().into_iter().collect()
     }
 }

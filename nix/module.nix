@@ -91,7 +91,7 @@ in
             (lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.default)
             "--listen=${cfg.listen}"
             "--database-url=postgres:///cv?host=/run/postgresql&user=cv"
-            "--checkout-dir=%S/cv"
+            "--mirror-dir=%S/cv"
             "--app-id=${toString cfg.appId}"
             "--client-id=${cfg.clientId}"
             "--private-key-file=%d/private-key"

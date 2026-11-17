@@ -1,9 +1,10 @@
 -- What `sync` derives from a repository's mirror and from GitHub.
 --
--- Content (commits, the people on them, diffs, the accounts of their emails) is keyed by content
--- and shared by every repository and branch that reaches it. What is per repository (branches)
--- refers to content and goes with its `repo` row. A row is inserted whole and never updated,
--- except `repo.full_name`; `mainline` rows are deleted and inserted.
+-- Content (commits, the people on them, diffs, facts, the accounts of their emails) is keyed by
+-- content and shared by every repository and branch that reaches it. What is per repository
+-- (branches) refers to content and goes with its `repo` row. A row is inserted whole and never
+-- updated, except `repo.full_name`; `mainline` rows are deleted and inserted, as are a blob's facts
+-- when the extractor changes.
 
 -- Object ids, raw. gix hashes with SHA-1.
 CREATE DOMAIN sha AS bytea CHECK (octet_length(VALUE) = 20);
@@ -131,3 +132,61 @@ CREATE VIEW commit_person_key AS
 SELECT p.*, coalesce('account:' || a.account_id, 'email:' || lower(p.email)) AS person
 FROM commit_person p
 LEFT JOIN email_account a ON a.email = lower(p.email);
+
+-- # Facts
+
+-- The language a path's content is read as; null where no extractor applies. Analyses join
+-- `change` to `blob_fact` through it.
+CREATE FUNCTION language(path text, mode mode) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT
+RETURN CASE WHEN mode IN ('file', 'executable') AND path LIKE '%.rs' THEN 'rust' END;
+
+-- What version `extractor` found in a blob read as `language`; a later version replaces the row.
+-- `status` is the first that applies:
+--
+--   too_large    larger than the extractor reads; `bytes` only
+--   binary       `bytes` only
+--   lfs_pointer  a Git LFS pointer; `bytes` only
+--   generated    a generator's marker in its first five lines
+--   unsupported  no extractor for `language`
+--   unparseable  not UTF-8
+--   too_deep     its syntax nests too deeply
+--   parsed       everything, and a `fn_fact` row per function
+CREATE TABLE blob_fact (
+    blob sha NOT NULL,
+    language text,
+    extractor int NOT NULL,
+    status text NOT NULL CHECK (status IN (
+        'too_large', 'binary', 'lfs_pointer', 'generated', 'unsupported', 'unparseable', 'too_deep',
+        'parsed'
+    )),
+    bytes bigint NOT NULL CHECK (bytes >= 0),
+    lines int CHECK (lines >= 0),
+    tokens int CHECK (tokens >= 0),
+    -- Syntax errors the parser recovered from.
+    errors int CHECK (errors >= 0),
+    UNIQUE NULLS NOT DISTINCT (blob, language),
+    CHECK ((lines IS NULL) = (status IN ('too_large', 'binary', 'lfs_pointer'))),
+    CHECK (num_nulls(tokens, errors) = CASE status WHEN 'parsed' THEN 0 ELSE 2 END)
+);
+
+-- Defined per language, in `src/facts/<language>.rs`. Names need not be unique.
+CREATE TABLE fn_fact (
+    blob sha NOT NULL,
+    language text NOT NULL,
+    name text NOT NULL,
+    start_line int NOT NULL CHECK (start_line >= 1),
+    end_line int NOT NULL CHECK (end_line >= start_line),
+    tokens int NOT NULL CHECK (tokens >= 0),
+    parameters int NOT NULL CHECK (parameters >= 0),
+    branch_points int NOT NULL CHECK (branch_points >= 0),
+    max_nesting int NOT NULL CHECK (max_nesting >= 0),
+    -- Equal for functions that differ only in names, literals, comments and layout.
+    shape bytea NOT NULL CHECK (octet_length(shape) = 32),
+    test bool NOT NULL,
+    errors int NOT NULL CHECK (errors >= 0),
+    FOREIGN KEY (blob, language) REFERENCES blob_fact (blob, language) ON DELETE CASCADE
+);
+
+-- Replacing a blob's facts deletes its functions through this.
+CREATE INDEX ON fn_fact (blob, language);
