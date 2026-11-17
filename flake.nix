@@ -54,6 +54,8 @@
               fileset = lib.fileset.unions [
                 (craneLib.fileset.commonCargoSources ./.)
                 ./migrations
+                # The C extractor's golden files, which are not Cargo sources.
+                ./src/facts/c
               ];
             };
             strictDeps = true;

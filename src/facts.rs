@@ -8,18 +8,21 @@
 //! A blob's path picks the language its content is read as, in SQL's `language()`. The content
 //! alone decides the facts.
 
+mod c;
 mod rust;
+mod syntax;
 
 use gix::ObjectId;
 use octocrab::models::RepositoryId;
 use sqlx::PgPool;
 use tracing::instrument;
 
+use self::syntax::CodeFacts;
 use crate::{Result, changes, column, limits, mirror::Mirror};
 
 /// Raising it extracts every blob again. Raise it whenever facts would change, a grammar upgrade
 /// included.
-pub const EXTRACTOR: i32 = 2;
+pub const EXTRACTOR: i32 = 3;
 
 pub async fn record(db: &PgPool, mirror: &Mirror, repository: RepositoryId) -> Result {
     for batch in missing(db, repository).await?.chunks(limits::BATCH) {
@@ -71,27 +74,6 @@ struct BlobFacts {
     code: Option<CodeFacts>,
 }
 
-/// What parsing a blob found.
-struct CodeFacts {
-    tokens: i32,
-    errors: i32,
-    functions: Vec<FunctionFacts>,
-}
-
-#[derive(Default)]
-struct FunctionFacts {
-    name: String,
-    start_line: i32,
-    end_line: i32,
-    tokens: i32,
-    parameters: i32,
-    branch_points: i32,
-    max_nesting: i32,
-    shape: [u8; 32],
-    test: bool,
-    errors: i32,
-}
-
 const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/";
 
 /// The first status in `blob_fact.status` that applies, and the facts it allows.
@@ -122,14 +104,17 @@ fn extract(
     }
     let lines = content.split_inclusive(|&byte| byte == b'\n').count();
     let lines = Some(lines.try_into()?);
-    let (status, code) = match language.as_deref() {
-        _ if is_generated(&content) => ("generated", None),
-        None => ("unsupported", None),
-        Some("rust") => match rust::parse(&content) {
-            Ok(code) => ("parsed", Some(code)),
-            Err(status) => (status, None),
-        },
+    let parsed = match language.as_deref() {
+        _ if is_generated(&content) => Err("generated"),
+        None => Err("unsupported"),
+        Some("rust") => syntax::parse(&content, &rust::RUST),
+        Some("c") => syntax::parse(&content, &c::C),
+        Some("cpp") => syntax::parse(&content, &c::CPP),
         Some(language) => return Err(format!("no extractor for {language}").into()),
+    };
+    let (status, code) = match parsed {
+        Ok(code) => ("parsed", Some(code)),
+        Err(status) => (status, None),
     };
     Ok(BlobFacts {
         blob,
@@ -222,7 +207,8 @@ mod tests {
 
     const REPOSITORY: RepositoryId = RepositoryId(1);
 
-    /// A blob of each status, the same bytes at a Rust and a text path, a symlink and a submodule.
+    /// A blob of each status and language, the same bytes at a Rust and a text path, a symlink and a
+    /// submodule.
     /// Then the Rust is edited, so a change has two sides.
     #[sqlx::test]
     async fn every_blob_has_facts_once_per_language(db: PgPool) {
@@ -239,6 +225,9 @@ mod tests {
         for (path, content) in [
             ("a.rs", rust),
             ("a.txt", rust),
+            ("a.c", include_str!("facts/c/golden.c")),
+            ("a.h", include_str!("facts/c/golden.h")),
+            ("a.cpp", include_str!("facts/c/golden.cpp")),
             ("binary.rs", "fn\0\n"),
             (
                 "broken.rs",
@@ -275,6 +264,9 @@ mod tests {
         assert_eq!(
             rows(&db, per_file).await,
             [
+                "a.c c parsed 1541 85 366 0 11",
+                "a.cpp cpp parsed 1442 75 392 0 13",
+                "a.h cpp parsed 515 29 117 0 2",
                 "a.rs rust parsed 2010 104 569 0 18",
                 "a.txt unsupported 2010 104 0",
                 "binary.rs rust binary 4 0",
