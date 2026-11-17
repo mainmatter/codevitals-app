@@ -102,3 +102,22 @@ macro_rules! unseen {
         fn hidden() {}
     };
 }
+
+// Whether a `cfg` holds only with `test`.
+#[cfg(/* reason */ test)]
+fn commented() {}
+
+#[cfg(all(unix, any(test, all(test, doc))))]
+fn nested() {}
+
+#[cfg(any(test, doc))]
+fn either() {}
+
+#[cfg(not(test))]
+fn negated() {}
+
+#[cfg(feature = "test")]
+fn feature() {}
+
+#[cfg(any())]
+fn nothing() {}

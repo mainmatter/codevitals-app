@@ -155,7 +155,8 @@ impl Mirror {
 
 // 1. Fetch
 
-/// Fails before receiving anything if GitHub's refs would not fit beside those already here.
+/// Fails before receiving anything if GitHub's refs would not fit beside those already here:
+/// receiving writes them, and pruning must read them all.
 fn fetch(
     repo: &gix::Repository,
     url: &str,
@@ -240,17 +241,14 @@ const REFS: &str = "refs in a mirror";
 
 fn read_refs(repo: &gix::Repository) -> Result<Refs> {
     let platform = repo.references()?;
-    let refs = platform
-        .all()?
-        .take(limits::MIRROR_REFS + 1)
-        .map(|reference| {
-            let reference = reference?.detach();
-            // Only direct refs are written here.
-            Ok((reference.name, reference.target.into_id()))
-        });
-    let refs = refs.collect::<Result<Refs>>()?;
-    limits::check(refs.len(), limits::MIRROR_REFS, REFS)?;
-    Ok(refs)
+    let refs = platform.all()?.map(|reference| {
+        let reference = reference?.detach();
+        // Only direct refs are written here.
+        Ok((reference.name, reference.target.into_id()))
+    });
+    Ok(limits::collect(refs, limits::MIRROR_REFS, REFS)?
+        .into_iter()
+        .collect())
 }
 
 fn remove_dir(path: &Path) -> io::Result<()> {

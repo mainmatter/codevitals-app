@@ -9,6 +9,7 @@ use tracing::info;
 use crate::{
     App, Result, accounts, commits, facts, mainline,
     mirror::{Mirror, Refs},
+    pulls,
 };
 
 /// Read from GitHub at the start of each sync.
@@ -41,6 +42,7 @@ pub async fn sync(app: &App, context: &Context) -> Result {
     mainline::record(db, &mirror, repository, &branches).await?;
     facts::record(db, &mirror, repository).await?;
     accounts::record(&context.github, db, &context.full_name, &commits).await?;
+    pulls::record(&context.github, db, repository, &context.full_name).await?;
     info!(repository = repository.0, "synced");
     Ok(())
 }

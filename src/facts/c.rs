@@ -93,16 +93,9 @@ fn parameters(source: &Source, node: Node) -> usize {
     let mut declared = list
         .named_children(&mut cursor)
         .filter(|p| !matches!(p.kind(), "comment" | "variadic_parameter"));
-    match declared.next() {
-        None => 0,
-        Some(first) => {
-            let rest = declared.count();
-            if rest == 0 && source.text(first) == "void" {
-                0
-            } else {
-                rest + 1
-            }
-        }
+    match (declared.next(), declared.count()) {
+        (Some(only), 0) if source.text(only) == "void" => 0,
+        (first, rest) => usize::from(first.is_some()) + rest,
     }
 }
 
@@ -154,89 +147,4 @@ fn test_macro<'t>(source: &Source, node: Node<'t>) -> Option<Node<'t>> {
         .filter(|d| d.kind() == "function_declarator")?;
     let name = source.field(invocation, "declarator")?;
     TEST_MACROS.contains(&name.as_str()).then_some(invocation)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::facts::syntax::{parse, summary};
-
-    #[test]
-    fn else_if_is_flat_but_else_loops_nest() {
-        for (statement, nesting) in [
-            ("if (x) {} else if (x) {}", 1),
-            ("if (x) {} else for (;;) {}", 2),
-            ("if (x) {} else while (x) {}", 2),
-        ] {
-            let source = format!("void f(int x) {{ {statement} }}");
-            for language in [&C, &CPP] {
-                let code = parse(source.as_bytes(), language).unwrap();
-                assert_eq!(code.errors, 0, "{source}");
-                assert_eq!(code.functions[0].max_nesting, nesting, "{source}");
-            }
-        }
-    }
-
-    #[test]
-    fn functions_returning_pointers_to_arrays() {
-        for language in [&C, &CPP] {
-            let code = parse(b"int (*f(int x))[3] { return 0; }", language).unwrap();
-            assert_eq!(code.errors, 0);
-            assert_eq!(code.functions.len(), 1);
-            assert_eq!(code.functions[0].name, "f");
-            assert_eq!(code.functions[0].parameters, 1);
-        }
-    }
-
-    #[test]
-    fn golden() {
-        let facts = |source, language| summary(&parse(source, language).unwrap());
-        assert_eq!(facts(include_bytes!("c/golden.c"), &C), GOLDEN_C.trim());
-        assert_eq!(facts(include_bytes!("c/golden.h"), &CPP), GOLDEN_H.trim());
-        assert_eq!(
-            facts(include_bytes!("c/golden.cpp"), &CPP),
-            GOLDEN_CPP.trim()
-        );
-    }
-
-    // `clamp` and `bound` share a shape. The prototype of `area` is not a function; each `speed`
-    // is one.
-    const GOLDEN_C: &str = "
-tokens 366 errors 0
-area 12-14 tokens 16 parameters 2 branch points 0 nesting 0 shape d653b7e4
-clamp 16-23 tokens 41 parameters 3 branch points 2 nesting 1 shape fccdb840
-bound 26-33 tokens 41 parameters 3 branch points 2 nesting 1 shape fccdb840
-describe 35-45 tokens 43 parameters 1 branch points 4 nesting 1 shape 51255981
-search 47-59 tokens 84 parameters 3 branch points 6 nesting 3 shape cbcfc742
-pick 61-63 tokens 23 parameters 1 branch points 1 nesting 0 shape 9a6b7039
-log_all 65-67 tokens 19 parameters 1 branch points 0 nesting 0 shape 867d4bda
-old_style 69-74 tokens 20 parameters 2 branch points 0 nesting 0 shape 29ba3fef
-speed 77-77 tokens 10 parameters 0 branch points 0 nesting 0 shape 83dc6e60
-speed 79-79 tokens 10 parameters 0 branch points 0 nesting 0 shape 83dc6e60
-main 82-85 tokens 25 parameters 0 branch points 0 nesting 0 shape f6bf33cc
-";
-
-    const GOLDEN_H: &str = "
-tokens 117 errors 0
-point_sum 21-23 tokens 20 parameters 1 branch points 0 nesting 0 shape 326acd6a
-sign 25-27 tokens 25 parameters 1 branch points 2 nesting 0 shape cd1e0c15
-";
-
-    // `Point()` and `draw` are declarations.
-    const GOLDEN_CPP: &str = "
-tokens 392 errors 0
-geometry::Point::Point 10-10 tokens 20 parameters 2 branch points 0 nesting 0 shape bca9654c
-geometry::Point::~Point 12-12 tokens 6 parameters 0 branch points 0 nesting 0 shape 9f2a5f21
-geometry::Point::operator== 15-17 tokens 25 parameters 1 branch points 1 nesting 0 shape 0f96de02
-geometry::Point::norm 24-26 tokens 24 parameters 0 branch points 0 nesting 0 shape 45a80c91
-geometry::(anonymous namespace)::helper 29-37 tokens 46 parameters 1 branch points 3 nesting 2 shape 84e93eef
-Box<T>::get 49-51 tokens 15 parameters 0 branch points 0 nesting 0 shape 61dbb6bc
-parse 53-61 tokens 44 parameters 1 branch points 2 nesting 1 shape f3e1c7b2
-main 63-70 tokens 53 parameters 0 branch points 0 nesting 0 shape e33fe1d6
-main::{lambda#0} 65-65 tokens 16 parameters 2 branch points 0 nesting 0 shape 362c3577
-main::{lambda#1} 66-68 tokens 15 parameters 0 branch points 0 nesting 0 shape 666c752a
-main::{lambda#1}::{lambda#0} 67-67 tokens 13 parameters 1 branch points 0 nesting 0 shape 8f245cfd
-TEST(Point, Norm) 72-75 tokens 31 parameters 0 branch points 0 nesting 0 shape 0946578d test
-TEST(Point, Norm)::{lambda#0} 73-73 tokens 13 parameters 1 branch points 0 nesting 0 shape af5b837b test
-";
 }

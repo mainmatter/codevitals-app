@@ -1,0 +1,12 @@
+tokens 366 errors 0
+area 12-14 tokens 16 parameters 2 branch points 0 nesting 0 shape d653b7e4
+clamp 16-23 tokens 41 parameters 3 branch points 2 nesting 1 shape fccdb840
+bound 26-33 tokens 41 parameters 3 branch points 2 nesting 1 shape fccdb840
+describe 35-45 tokens 43 parameters 1 branch points 4 nesting 1 shape 51255981
+search 47-59 tokens 84 parameters 3 branch points 6 nesting 3 shape cbcfc742
+pick 61-63 tokens 23 parameters 1 branch points 1 nesting 0 shape 9a6b7039
+log_all 65-67 tokens 19 parameters 1 branch points 0 nesting 0 shape 867d4bda
+old_style 69-74 tokens 20 parameters 2 branch points 0 nesting 0 shape 29ba3fef
+speed 77-77 tokens 10 parameters 0 branch points 0 nesting 0 shape 83dc6e60
+speed 79-79 tokens 10 parameters 0 branch points 0 nesting 0 shape 83dc6e60
+main 82-85 tokens 25 parameters 0 branch points 0 nesting 0 shape f6bf33cc

@@ -1,0 +1,31 @@
+tokens 566 errors 0
+clamp 9-15 tokens 27 parameters 3 branch points 2 nesting 1 shape c248833c
+bound 18-25 tokens 27 parameters 3 branch points 2 nesting 1 shape c248833c
+signature 28-29 tokens 33 parameters 7 branch points 0 nesting 0 shape e476ce45
+keyword_only 32-33 tokens 11 parameters 2 branch points 0 nesting 0 shape 59d4ec0e
+keyword_only::{lambda#0} 33-33 tokens 5 parameters 0 branch points 0 nesting 0 shape cd711881
+fetch 36-44 tokens 48 parameters 2 branch points 3 nesting 2 shape b8b17361
+describe 47-54 tokens 49 parameters 1 branch points 6 nesting 1 shape 6ce60225
+outer 57-65 tokens 32 parameters 1 branch points 2 nesting 0 shape 71307cbe
+outer::inner 58-62 tokens 10 parameters 1 branch points 0 nesting 0 shape 00bc5cd4
+outer::inner::innermost 59-60 tokens 7 parameters 0 branch points 0 nesting 0 shape efb3f49a
+outer::{lambda#0} 65-65 tokens 8 parameters 1 branch points 0 nesting 0 shape 20161a0b
+outer::{lambda#0}::{lambda#0} 65-65 tokens 5 parameters 1 branch points 0 nesting 0 shape 7f1af455
+Point::{lambda#0} 69-69 tokens 8 parameters 0 branch points 0 nesting 0 shape d93f18cb
+Point::__init__ 71-72 tokens 21 parameters 3 branch points 0 nesting 0 shape e7568fe3
+Point::norm 75-76 tokens 22 parameters 1 branch points 0 nesting 0 shape aec3fa2a
+Point::parse 80-82 tokens 29 parameters 1 branch points 0 nesting 0 shape 9e7d1eca
+Point::Builder::build 85-86 tokens 13 parameters 1 branch points 0 nesting 0 shape 507dc5c1
+make 89-94 tokens 10 parameters 0 branch points 0 nesting 0 shape 0e282b77
+make::Local::method 91-92 tokens 8 parameters 1 branch points 0 nesting 0 shape 229560c4
+{lambda#0} 97-97 tokens 3 parameters 0 branch points 0 nesting 0 shape e294620e
+memoized 98-99 tokens 8 parameters 1 branch points 0 nesting 0 shape 229560c4
+speed 103-103 tokens 7 parameters 0 branch points 0 nesting 0 shape ff64c652
+speed 105-105 tokens 7 parameters 0 branch points 0 nesting 0 shape ff64c652
+test_clamp 108-109 tokens 26 parameters 0 branch points 1 nesting 0 shape d50f10b7 test
+point 113-114 tokens 12 parameters 0 branch points 0 nesting 0 shape 57d839ce test
+parses 119-120 tokens 13 parameters 1 branch points 0 nesting 0 shape d8e78101 test
+TestPoint::helper 124-125 tokens 7 parameters 1 branch points 0 nesting 0 shape dbbc56f8 test
+TestPoint::helper::{lambda#0} 125-125 tokens 8 parameters 0 branch points 0 nesting 0 shape d93f18cb test
+PointTests::setUp 129-130 tokens 16 parameters 1 branch points 0 nesting 0 shape cfb4d679 test
+greet 133-134 tokens 8 parameters 1 branch points 0 nesting 0 shape 693436a4

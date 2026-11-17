@@ -210,7 +210,7 @@ mod tests {
         repo(&db).await;
         let mirror = Mirror(scratch("facts"));
         let work = &mirror.0;
-        let rust = include_str!("facts/rust/golden.rs");
+        let (rust, c) = ("fn f() {}\n", "int f(void) { return 0; }\n");
         git(work, &["init", "--initial-branch=main"]);
         git(work, &["commit", "--allow-empty", "-m", "root"]);
         let root = git(work, &["rev-parse", "HEAD"]);
@@ -220,10 +220,10 @@ mod tests {
         for (path, content) in [
             ("a.rs", rust),
             ("a.txt", rust),
-            ("a.c", include_str!("facts/c/golden.c")),
-            ("a.h", include_str!("facts/c/golden.h")),
-            ("a.cpp", include_str!("facts/c/golden.cpp")),
-            ("a.py", include_str!("facts/python/golden.py")),
+            ("a.c", c),
+            ("a.h", c),
+            ("a.cpp", c),
+            ("a.py", "def f():\n    pass\n"),
             ("binary.rs", "fn\0\n"),
             (
                 "broken.rs",
@@ -260,12 +260,12 @@ mod tests {
         assert_eq!(
             rows(&db, per_file).await,
             [
-                "a.c c parsed 1541 85 366 0 11",
-                "a.cpp cpp parsed 1442 75 392 0 13",
-                "a.h cpp parsed 515 29 117 0 2",
-                "a.py python parsed 2513 130 558 0 29",
-                "a.rs rust parsed 2010 104 569 0 18",
-                "a.txt unsupported 2010 104 0",
+                "a.c c parsed 26 1 10 0 1",
+                "a.cpp cpp parsed 26 1 10 0 1",
+                "a.h cpp parsed 26 1 10 0 1",
+                "a.py python parsed 18 2 6 0 1",
+                "a.rs rust parsed 10 1 6 0 1",
+                "a.txt unsupported 10 1 0",
                 "binary.rs rust binary 4 0",
                 "broken.rs rust parsed 53 3 21 1 3",
                 "deep.rs rust too_deep 2216 1 0",

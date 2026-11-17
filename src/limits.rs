@@ -26,6 +26,8 @@ pub fn collect<T>(
 /// GitHub sends up to 25 MB.
 pub const WEBHOOK_BODY: usize = 25 << 20;
 pub const GITHUB_REQUEST: Duration = Duration::from_secs(30);
+/// Items in one page of a GitHub list: its maximum.
+pub const PER_PAGE: usize = 100;
 
 pub const INSTALLATIONS: usize = 1_000;
 /// Repositories served, across all installations.
@@ -60,3 +62,6 @@ pub const BATCH: usize = 1_000;
 pub const FACT_BYTES: u64 = 1 << 20;
 /// A deeper syntax tree is `too_deep`.
 pub const SYNTAX_DEPTH: usize = 1_000;
+
+/// In one repository. The largest have a few hundred thousand.
+pub const PULLS: usize = 1_000_000;

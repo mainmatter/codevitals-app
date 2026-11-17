@@ -117,10 +117,6 @@ async fn ask(
         "variables": { "owner": owner, "name": name },
     });
     let data: Data = github.graphql(&request).await?;
-
-    if data.repository.len() != unasked.len() {
-        return Err("an answer missing a commit asked about".into());
-    }
     let mut accounts = HashMap::new();
     for commit in data.repository.into_values() {
         limits::check(commit.authors.total, max, "authors on a commit")?;

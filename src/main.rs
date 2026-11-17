@@ -18,6 +18,7 @@ mod fixtures;
 mod limits;
 mod mainline;
 mod mirror;
+mod pulls;
 mod sign_in;
 mod sync;
 
@@ -210,18 +211,48 @@ fn column<'r, R, T>(rows: &'r [R], field: impl Fn(&'r R) -> T) -> Vec<T> {
 
 /// Every item of GitHub's list at `path`. Fails past `limit` items.
 async fn list<T: DeserializeOwned>(github: &Octocrab, path: &str, limit: usize) -> Result<Vec<T>> {
-    // GitHub's maximum.
-    const PER_PAGE: usize = 100;
-    let mut page: Page<T> = github.get(path, Some(&[("per_page", PER_PAGE)])).await?;
-    let mut items = Vec::new();
-    for _ in 0..limit.div_ceil(PER_PAGE) {
-        items.append(&mut page.items);
-        match github.get_page(&page.next).await? {
-            Some(next) => page = next,
-            None => return Ok(items),
+    let (mut pages, mut items) = (Pages::new(github, path, limit, 1), Vec::new());
+    while let Some(mut page) = pages.next().await? {
+        items.append(&mut page);
+    }
+    Ok(items)
+}
+
+/// GitHub's list at `path`, a page at a time from page `first`. Fails past `limit` items,
+/// counting those on the pages before `first`.
+struct Pages<'a> {
+    github: &'a Octocrab,
+    path: &'a str,
+    limit: usize,
+    pages: usize,
+    items: usize,
+}
+
+impl<'a> Pages<'a> {
+    fn new(github: &'a Octocrab, path: &'a str, limit: usize, first: usize) -> Self {
+        let pages = first - 1;
+        let items = pages * limits::PER_PAGE;
+        Pages {
+            github,
+            path,
+            limit,
+            pages,
+            items,
         }
     }
-    Err(format!("more than {limit} items at {path}").into())
+
+    /// Only the last page is short, and may be empty.
+    async fn next<T: DeserializeOwned>(&mut self) -> Result<Option<Vec<T>>> {
+        if self.items < self.pages * limits::PER_PAGE {
+            return Ok(None);
+        }
+        self.pages += 1;
+        let query = [("per_page", limits::PER_PAGE), ("page", self.pages)];
+        let page: Page<T> = self.github.get(self.path, Some(&query)).await?;
+        self.items += page.items.len();
+        limits::check(self.items, self.limit, &format!("items at {}", self.path))?;
+        Ok(Some(page.items))
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +266,7 @@ mod tests {
 
     use super::*;
 
+    /// clap checks its definitions in debug builds only.
     #[test]
     fn config_is_valid() {
         Config::command().debug_assert();

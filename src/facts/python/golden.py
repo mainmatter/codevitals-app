@@ -128,3 +128,7 @@ class TestPoint:
 class PointTests(unittest.TestCase):
     def setUp(self):
         self.point = Point(3, 4)
+
+
+def greet(name):
+    return f"hello {name.title()}"

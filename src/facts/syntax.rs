@@ -127,6 +127,14 @@ pub fn parse(source: &[u8], language: &Language) -> Result<CodeFacts, &'static s
     Ok(walk.code)
 }
 
+/// Children of `node` of `kind`.
+pub fn count_children(node: Node, kind: &str) -> i32 {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .filter(|child| child.kind() == kind)
+        .count() as i32
+}
+
 /// Counted as one token: what is inside it is its value. The C and Rust grammars name literals
 /// `…_literal`; tree-sitter-python's one literal with children is `string`.
 fn is_literal(node: Node) -> bool {
@@ -260,26 +268,56 @@ impl Walk<'_, '_> {
     }
 }
 
-/// A line for the file, then one per function: what golden tests compare.
 #[cfg(test)]
-pub fn summary(code: &CodeFacts) -> String {
-    let mut lines = vec![format!("tokens {} errors {}", code.tokens, code.errors)];
-    for function in &code.functions {
-        let shape: String = function.shape[..4]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        lines.push(format!(
-            "{} {}-{} tokens {} parameters {} branch points {} nesting {} shape {shape}{}",
-            function.name,
-            function.start_line,
-            function.end_line,
-            function.tokens,
-            function.parameters,
-            function.branch_points,
-            function.max_nesting,
-            if function.test { " test" } else { "" },
-        ));
+mod tests {
+    use super::*;
+    use crate::facts::{c, python, rust};
+
+    /// Each golden source beside its `.facts`: a line for the file, then one per function.
+    #[test]
+    fn golden() {
+        for (source, language, expected) in [
+            (
+                &include_bytes!("rust/golden.rs")[..],
+                &rust::RUST,
+                include_str!("rust/golden.rs.facts"),
+            ),
+            (
+                include_bytes!("c/golden.c"),
+                &c::C,
+                include_str!("c/golden.c.facts"),
+            ),
+            (
+                include_bytes!("c/golden.h"),
+                &c::CPP,
+                include_str!("c/golden.h.facts"),
+            ),
+            (
+                include_bytes!("c/golden.cpp"),
+                &c::CPP,
+                include_str!("c/golden.cpp.facts"),
+            ),
+            (
+                include_bytes!("python/golden.py"),
+                &python::PYTHON,
+                include_str!("python/golden.py.facts"),
+            ),
+        ] {
+            let code = parse(source, language).unwrap();
+            let mut lines = vec![format!("tokens {} errors {}", code.tokens, code.errors)];
+            for f in &code.functions {
+                let shape: String = f.shape[..4]
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                let test = if f.test { " test" } else { "" };
+                lines.push(format!(
+                    "{} {}-{} tokens {} parameters {} branch points {} nesting {} shape {shape}{test}",
+                    f.name, f.start_line, f.end_line, f.tokens, f.parameters, f.branch_points,
+                    f.max_nesting,
+                ));
+            }
+            assert_eq!(lines.join("\n"), expected.trim());
+        }
     }
-    lines.join("\n")
 }

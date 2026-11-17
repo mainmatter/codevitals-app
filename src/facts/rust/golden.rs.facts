@@ -1,0 +1,25 @@
+tokens 674 errors 0
+Point::new 12-14 tokens 22 parameters 2 branch points 0 nesting 0 shape f765e5fe
+Point::scaled 17-19 tokens 38 parameters 2 branch points 0 nesting 0 shape 09eb1bd7
+Point::scaled::{closure#0} 18-18 tokens 6 parameters 1 branch points 0 nesting 0 shape 5c9ef157
+<Point as fmt::Display>::fmt 23-25 tokens 39 parameters 2 branch points 0 nesting 0 shape 29173e1b
+Shape::describe 31-33 tokens 33 parameters 1 branch points 1 nesting 1 shape ac200362
+classify 36-62 tokens 131 parameters 2 branch points 10 nesting 3 shape 9b3c0ba1
+classify::helper 37-39 tokens 25 parameters 1 branch points 2 nesting 0 shape 4b4645a5
+classify::{closure#0} 43-43 tokens 24 parameters 1 branch points 0 nesting 0 shape 09a13a40
+classify::{closure#0}::{closure#0} 43-43 tokens 8 parameters 1 branch points 0 nesting 0 shape 3fb2884d
+classify::{closure#1} 58-58 tokens 3 parameters 0 branch points 0 nesting 0 shape 3c7207f0
+same_shape_as_helper 64-66 tokens 25 parameters 1 branch points 2 nesting 0 shape 4b4645a5
+tests::classifies 73-76 tokens 21 parameters 0 branch points 0 nesting 0 shape fbb654b2 test
+tests::classifies::{closure#0} 74-74 tokens 13 parameters 1 branch points 0 nesting 0 shape 6d574216 test
+tests::fixture 78-80 tokens 16 parameters 0 branch points 0 nesting 0 shape 54e1d5b9 test
+support::always 86-88 tokens 13 parameters 1 branch points 0 nesting 0 shape 87a4e560 test
+runs_async 92-92 tokens 7 parameters 0 branch points 0 nesting 0 shape b224bb64 test
+slow 95-95 tokens 6 parameters 0 branch points 0 nesting 0 shape 41e038db test
+sometimes 98-98 tokens 6 parameters 0 branch points 0 nesting 0 shape 41e038db
+commented 108-108 tokens 6 parameters 0 branch points 0 nesting 0 shape 41e038db test
+nested 111-111 tokens 6 parameters 0 branch points 0 nesting 0 shape 41e038db test
+either 114-114 tokens 6 parameters 0 branch points 0 nesting 0 shape 41e038db
+negated 117-117 tokens 6 parameters 0 branch points 0 nesting 0 shape 41e038db
+feature 120-120 tokens 6 parameters 0 branch points 0 nesting 0 shape 41e038db
+nothing 123-123 tokens 6 parameters 0 branch points 0 nesting 0 shape 41e038db

@@ -2,9 +2,9 @@
 --
 -- Content (commits, the people on them, diffs, facts, the accounts of their emails) is keyed by
 -- content and shared by every repository and branch that reaches it. What is per repository
--- (branches) refers to content and goes with its `repo` row. A row is inserted whole and never
--- updated, except `repo.full_name`; `mainline` rows are deleted and inserted, as are a blob's facts
--- when the extractor changes.
+-- (branches, pull requests) refers to content and goes with its `repo` row. A row is inserted whole
+-- and never updated, except `repo` and a `pull` whose update time moves; `mainline` rows are
+-- deleted and inserted, as are a blob's facts when the extractor changes.
 
 -- Object ids, raw. gix hashes with SHA-1.
 CREATE DOMAIN sha AS bytea CHECK (octet_length(VALUE) = 20);
@@ -15,7 +15,12 @@ CREATE TABLE repo (
     -- GitHub's id, which survives renames and transfers.
     id bigint PRIMARY KEY,
     -- As of the latest sync.
-    full_name text NOT NULL
+    full_name text NOT NULL,
+    -- How far `pull` is read, in GitHub's list by update time, newest first: every pull request
+    -- updated before `pulls_since` has a current row, except those from page `pulls_page` on,
+    -- which a first sync has yet to read. Null before the first.
+    pulls_since timestamptz,
+    pulls_page int
 );
 
 -- # Commits
@@ -113,6 +118,31 @@ WITH written AS (
 SELECT repo, branch, path, new_oid AS oid, new_mode AS mode, int4range(seq, replaced) AS seqs
 FROM written
 WHERE new_oid IS NOT NULL;
+
+-- # Pull requests
+
+-- Each pull request, whatever its state, as GitHub described it at `updated`. Its commits need not
+-- have rows.
+CREATE TABLE pull (
+    repo bigint NOT NULL REFERENCES repo ON DELETE CASCADE,
+    number int NOT NULL CHECK (number >= 1),
+    state text NOT NULL CHECK (state IN ('open', 'closed')),
+    draft bool NOT NULL,
+    base_ref text NOT NULL,
+    head sha NOT NULL,
+    created timestamptz NOT NULL,
+    updated timestamptz NOT NULL,
+    merged timestamptz,
+    closed timestamptz,
+    -- What it merged as; null unless merged.
+    merge_commit sha,
+    -- GitHub's account; a deleted one is its `ghost`.
+    author_id bigint NOT NULL,
+    author_login text NOT NULL,
+    -- `User`, `Bot`, `Organization`, ...
+    author_type text NOT NULL,
+    PRIMARY KEY (repo, number)
+);
 
 -- # People
 

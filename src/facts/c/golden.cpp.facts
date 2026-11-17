@@ -1,0 +1,14 @@
+tokens 392 errors 0
+geometry::Point::Point 10-10 tokens 20 parameters 2 branch points 0 nesting 0 shape bca9654c
+geometry::Point::~Point 12-12 tokens 6 parameters 0 branch points 0 nesting 0 shape 9f2a5f21
+geometry::Point::operator== 15-17 tokens 25 parameters 1 branch points 1 nesting 0 shape 0f96de02
+geometry::Point::norm 24-26 tokens 24 parameters 0 branch points 0 nesting 0 shape 45a80c91
+geometry::(anonymous namespace)::helper 29-37 tokens 46 parameters 1 branch points 3 nesting 2 shape 84e93eef
+Box<T>::get 49-51 tokens 15 parameters 0 branch points 0 nesting 0 shape 61dbb6bc
+parse 53-61 tokens 44 parameters 1 branch points 2 nesting 1 shape f3e1c7b2
+main 63-70 tokens 53 parameters 0 branch points 0 nesting 0 shape e33fe1d6
+main::{lambda#0} 65-65 tokens 16 parameters 2 branch points 0 nesting 0 shape 362c3577
+main::{lambda#1} 66-68 tokens 15 parameters 0 branch points 0 nesting 0 shape 666c752a
+main::{lambda#1}::{lambda#0} 67-67 tokens 13 parameters 1 branch points 0 nesting 0 shape 8f245cfd
+TEST(Point, Norm) 72-75 tokens 31 parameters 0 branch points 0 nesting 0 shape 0946578d test
+TEST(Point, Norm)::{lambda#0} 73-73 tokens 13 parameters 1 branch points 0 nesting 0 shape af5b837b test

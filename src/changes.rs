@@ -34,7 +34,7 @@ pub struct CommitPair {
 pub async fn record(db: &PgPool, mirror: &Mirror, pairs: &[CommitPair]) -> Result {
     let missing = missing(db, pairs).await?;
     mirror
-        .read_each(&missing, diff_pair, |changes| insert(db, changes))
+        .read_each(&missing, diff_pair, |diffed| insert(db, diffed))
         .await
 }
 
@@ -61,12 +61,6 @@ async fn missing(db: &PgPool, pairs: &[CommitPair]) -> Result<Vec<CommitPair>> {
 
 // 2. Diff
 
-/// A pair's `change` rows.
-struct PairChanges {
-    pair: CommitPair,
-    files: Vec<FileChange>,
-}
-
 struct FileChange {
     path: String,
     old: Option<Entry>,
@@ -82,7 +76,7 @@ struct Entry {
     mode: &'static str,
 }
 
-fn diff_pair(repo: &gix::Repository, pair: CommitPair) -> Result<PairChanges> {
+fn diff_pair(repo: &gix::Repository, pair: CommitPair) -> Result<(CommitPair, Vec<FileChange>)> {
     let base = match pair.base {
         Some(base) => repo.find_commit(base)?.tree()?,
         None => repo.empty_tree(),
@@ -107,19 +101,18 @@ fn diff_pair(repo: &gix::Repository, pair: CommitPair) -> Result<PairChanges> {
     )?;
     diffed?;
 
-    let mut files = Vec::new();
-    for (path, old, new) in changed.files {
+    let files = changed.files.into_iter().map(|(path, old, new)| {
         let (lines_added, lines_deleted) = count_lines(repo, old, new)?.unzip();
         let path = path.to_str()?.to_owned();
-        files.push(FileChange {
+        Ok(FileChange {
             path,
             old,
             new,
             lines_added,
             lines_deleted,
-        });
-    }
-    Ok(PairChanges { pair, files })
+        })
+    });
+    Ok((pair, files.collect::<Result<_>>()?))
 }
 
 /// The changed files, with paths kept as gix's `Recorder` keeps them. Stops once the paths of
@@ -230,8 +223,8 @@ pub fn is_binary(content: &[u8]) -> bool {
 
 // 3. Insert
 
-async fn insert(db: &PgPool, changes: PairChanges) -> Result {
-    let files = &changes.files;
+async fn insert(db: &PgPool, (pair, files): (CommitPair, Vec<FileChange>)) -> Result {
+    let files = &files;
     let oid = |entry: Option<Entry>| entry.map(|entry| entry.oid.as_slice().to_vec());
     let mode = |entry: Option<Entry>| entry.map(|entry| entry.mode);
     sqlx::query(
@@ -240,8 +233,8 @@ async fn insert(db: &PgPool, changes: PairChanges) -> Result {
          ) AS f
          ON CONFLICT DO NOTHING",
     )
-    .bind(changes.pair.base.as_ref().map(ObjectId::as_slice))
-    .bind(changes.pair.head.as_slice())
+    .bind(pair.base.as_ref().map(ObjectId::as_slice))
+    .bind(pair.head.as_slice())
     .bind(column(files, |file| file.path.as_str()))
     .bind(column(files, |file| oid(file.old)))
     .bind(column(files, |file| mode(file.old)))
