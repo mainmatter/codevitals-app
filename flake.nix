@@ -57,6 +57,7 @@
                 # Golden files that are not Cargo sources.
                 ./src/facts/c
                 ./src/facts/python
+                ./src/facts/rust
               ];
             };
             strictDeps = true;
