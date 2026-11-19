@@ -26,11 +26,17 @@ let
         (alert "CvRepoSyncFailing" "cv_repo_sync_failures_consecutive >= 3" "0m"
           "Repository {{ $labels.repository }} failed its last {{ $value }} syncs; see the journal."
         )
-        (alert "CvRepoStale" "time() - cv_repo_last_sync_success_timestamp_seconds > 6 * 3600" "0m"
+        # A process exports no success until a repository has one, and no duration until a sync
+        # ends: nothing to compute an age from. So these two rule out recent progress, and `for`
+        # counts the time.
+        (alert "CvRepoStale"
+          "cv_repo_sync_failures_consecutive unless time() - cv_repo_last_sync_success_timestamp_seconds < 900"
+          "6h"
           "Repository {{ $labels.repository }} has not synced for over 6 hours."
         )
         (alert "CvSyncStuck"
-          "cv_syncs_running > 0 and on () sum(increase(cv_sync_duration_seconds_count[3h])) == 0" "0m"
+          "cv_syncs_running > 0 unless on () sum(increase(cv_sync_duration_seconds_count[15m])) > 0"
+          "3h"
           "Syncs are running, but none has ended for 3 hours."
         )
         (alert "CvResyncFailing" "time() - cv_resync_last_success_timestamp_seconds > 3 * 3600" "0m"
