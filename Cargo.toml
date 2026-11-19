@@ -56,4 +56,6 @@ opt-level = 3
 opt-level = 3
 
 [dev-dependencies]
+# `test-util`: tests of timeouts pause the clock.
+tokio = { version = "1.54.1", features = ["test-util"] }
 tower = { version = "0.5.3", features = ["util"] }

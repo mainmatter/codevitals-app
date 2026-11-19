@@ -188,20 +188,27 @@ async fn main() -> Result {
 }
 
 fn router(app: Arc<App>) -> Router {
+    // For what anyone can reach. The timeout covers waiting for a turn.
+    let bound = |time, at_once| {
+        ServiceBuilder::new()
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                time,
+            ))
+            .layer(ConcurrencyLimitLayer::new(at_once))
+    };
     Router::new()
         .route("/setup", get(sign_in::setup))
-        .route("/callback", get(sign_in::callback))
-        // Anyone can reach it, and a body is read whole before its signature is checked. axum
-        // accepts 2 MB by default. The timeout covers waiting for a turn.
+        // It asks GitHub whenever the cookie matches `state`, and the caller picks both.
+        .route(
+            "/callback",
+            get(sign_in::callback).layer(bound(limits::SIGN_IN_TIME, limits::SIGN_INS_AT_ONCE)),
+        )
+        // A body is read whole before its signature is checked. axum accepts 2 MB by default.
         .route(
             "/webhook",
             post(sync::webhook).layer(
-                ServiceBuilder::new()
-                    .layer(TimeoutLayer::with_status_code(
-                        StatusCode::REQUEST_TIMEOUT,
-                        limits::WEBHOOK_TIME,
-                    ))
-                    .layer(ConcurrencyLimitLayer::new(limits::WEBHOOKS_AT_ONCE))
+                bound(limits::WEBHOOK_TIME, limits::WEBHOOKS_AT_ONCE)
                     .layer(DefaultBodyLimit::max(limits::WEBHOOK_BODY)),
             ),
         )

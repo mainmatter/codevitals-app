@@ -111,3 +111,43 @@ fn failed(error: impl Display) -> StatusCode {
     warn!(%error, "sign-in failed");
     StatusCode::BAD_GATEWAY
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::fixtures;
+
+    /// GitHub never answers. Callbacks that pass the check ask it only so many at once, and all
+    /// give up, those still waiting for a turn included.
+    #[tokio::test(start_paused = true)]
+    async fn callbacks_are_bounded() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        let github = fixtures::github(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::future::pending()
+        });
+        let router = crate::router(fixtures::app(github));
+        let uri = format!("/callback?code=code&state={}", challenge("verifier"));
+        let callbacks = Vec::from_iter((0..2 * limits::SIGN_INS_AT_ONCE).map(|_| {
+            let request = Request::get(&uri)
+                .header(COOKIE, format!("{VERIFIER_COOKIE}=verifier"))
+                .body(Body::empty())
+                .unwrap();
+            tokio::spawn(router.clone().oneshot(request))
+        }));
+
+        // The paused clock moves once every task waits.
+        tokio::time::sleep(limits::SIGN_IN_TIME / 2).await;
+        assert_eq!(asked.load(Ordering::SeqCst), limits::SIGN_INS_AT_ONCE);
+        for callback in callbacks {
+            let response = callback.await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        }
+    }
+}
