@@ -29,7 +29,7 @@ use octocrab::{
 use serde::Deserialize;
 use tracing::{Instrument, Span, field::Empty, info, info_span, warn};
 
-use crate::{App, Result, app, limits, list, telemetry};
+use crate::{App, Result, app, describe, limits, list, telemetry};
 
 // 1. Triggers
 
@@ -113,7 +113,7 @@ pub async fn resync(app: Arc<App>) {
         match schedule_all(&app).await {
             Ok(true) => telemetry::RESYNC_LAST_SUCCESS.set(telemetry::now()),
             Ok(false) => {}
-            Err(error) => warn!(%error, "resync failed"),
+            Err(error) => warn!(error = %describe(&*error), "resync failed"),
         }
     }
 }
@@ -135,6 +135,7 @@ async fn schedule_all(app: &Arc<App>) -> Result<bool> {
         match scheduled.await {
             Ok(scheduled) => repositories += scheduled,
             Err(error) => {
+                let error = describe(&*error);
                 warn!(installation = installation.id.0, %error, "resync failed");
                 failed += 1;
             }
@@ -199,6 +200,7 @@ async fn run(app: Arc<App>, repository: RepositoryId) {
         let label = [repository.0.to_string()];
         match (synced, kind) {
             (Err(error), _) => {
+                let error = describe(&*error);
                 warn!(repository = repository.0, kind, %error, "sync failed");
                 telemetry::REPO_FAILURES.with_label_values(&label).inc();
             }

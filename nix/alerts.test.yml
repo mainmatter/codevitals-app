@@ -1,0 +1,47 @@
+# Run by `nix flake check` against the rules in `module.nix`: what a process that has just started
+# does not export. A sample a minute from 0; `_` is none.
+rule_files: [cv-alerts.json]
+evaluation_interval: 1m
+
+tests:
+  - name: the first sync after a start, an hour in, hangs
+    input_series:
+      - series: cv_syncs_running
+        values: 0x59 1x300
+    alert_rule_test:
+      - alertname: CvSyncStuck
+        eval_time: 3h59m
+      - alertname: CvSyncStuck
+        eval_time: 4h
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: Syncs are running, but none has ended for 3 hours.
+
+  - name: syncs end while another runs
+    input_series:
+      - series: cv_syncs_running
+        values: 1x300
+      - series: cv_sync_duration_seconds_count{kind="sync", outcome="ok"}
+        values: 0+1x300
+    alert_rule_test:
+      - alertname: CvSyncStuck
+        eval_time: 4h
+
+  - name: one repository has only failed since the start, another synced
+    input_series:
+      - series: cv_repo_sync_failures_consecutive{repository="1"}
+        values: 1+0x400
+      - series: cv_repo_sync_failures_consecutive{repository="2"}
+        values: 0x400
+      - series: cv_repo_last_sync_success_timestamp_seconds{repository="2"}
+        values: 0+60x400
+    alert_rule_test:
+      - alertname: CvRepoStale
+        eval_time: 5h59m
+      - alertname: CvRepoStale
+        eval_time: 6h
+        exp_alerts:
+          - exp_labels: { severity: warning, repository: "1" }
+            exp_annotations:
+              summary: Repository 1 has not synced for over 6 hours.

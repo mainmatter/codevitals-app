@@ -188,20 +188,27 @@ async fn main() -> Result {
 }
 
 fn router(app: Arc<App>) -> Router {
+    // For what anyone can reach. The timeout covers waiting for a turn.
+    let bound = |time, at_once| {
+        ServiceBuilder::new()
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                time,
+            ))
+            .layer(ConcurrencyLimitLayer::new(at_once))
+    };
     Router::new()
         .route("/setup", get(sign_in::setup))
-        .route("/callback", get(sign_in::callback))
-        // Anyone can reach it, and a body is read whole before its signature is checked. axum
-        // accepts 2 MB by default. The timeout covers waiting for a turn.
+        // It asks GitHub whenever the cookie matches `state`, and the caller picks both.
+        .route(
+            "/callback",
+            get(sign_in::callback).layer(bound(limits::SIGN_IN_TIME, limits::SIGN_INS_AT_ONCE)),
+        )
+        // A body is read whole before its signature is checked. axum accepts 2 MB by default.
         .route(
             "/webhook",
             post(sync::webhook).layer(
-                ServiceBuilder::new()
-                    .layer(TimeoutLayer::with_status_code(
-                        StatusCode::REQUEST_TIMEOUT,
-                        limits::WEBHOOK_TIME,
-                    ))
-                    .layer(ConcurrencyLimitLayer::new(limits::WEBHOOKS_AT_ONCE))
+                bound(limits::WEBHOOK_TIME, limits::WEBHOOKS_AT_ONCE)
                     .layer(DefaultBodyLimit::max(limits::WEBHOOK_BODY)),
             ),
         )
@@ -271,6 +278,17 @@ fn column<'r, R, T>(rows: &'r [R], field: impl Fn(&'r R) -> T) -> Vec<T> {
     rows.iter().map(field).collect()
 }
 
+/// An error as logged. octocrab displays an answer GitHub refused with as `GitHub` alone: this
+/// adds the status and GitHub's message.
+fn describe(error: &(dyn Error + 'static)) -> String {
+    match error.downcast_ref() {
+        Some(octocrab::Error::GitHub { source, .. }) => {
+            format!("GitHub: {}: {}", source.status_code, source.message)
+        }
+        _ => error.to_string(),
+    }
+}
+
 /// Every item of GitHub's list at `path`. Fails past `limit` items.
 async fn list<T: DeserializeOwned>(github: &Octocrab, path: &str, limit: usize) -> Result<Vec<T>> {
     let mut items = Vec::new();
@@ -335,6 +353,19 @@ mod tests {
             let response = router.clone().oneshot(request).await.unwrap();
             assert_eq!(response.status(), status, "{body}");
         }
+    }
+
+    #[tokio::test]
+    async fn describe_adds_githubs_status_and_message() {
+        let github = fixtures::github(|_| async {
+            let body = serde_json::json!({ "message": "Bad credentials" });
+            (StatusCode::UNAUTHORIZED, body)
+        });
+        let error = page::<()>(&github, "/app/installations", 1).await;
+        assert_eq!(
+            describe(&*error.unwrap_err()),
+            "GitHub: 401 Unauthorized: Bad credentials"
+        );
     }
 
     /// As GitHub signs with the secret `secret`: HMAC-SHA256.

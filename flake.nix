@@ -57,6 +57,7 @@
                 # Golden files that are not Cargo sources.
                 ./src/facts/c
                 ./src/facts/python
+                ./src/facts/rust
               ];
             };
             strictDeps = true;
@@ -119,6 +120,29 @@
             diff -u <(${lib.getExe cv} --help | ${flags}) <(< ${./nix/module.nix} ${flags})
             touch $out
           '';
+
+          # The alert rules a host gets from the module, against `nix/alerts.test.yml`.
+          alerts =
+            let
+              host = lib.nixosSystem {
+                modules = [
+                  self.nixosModules.default
+                  {
+                    nixpkgs.pkgs = pkgs;
+                    services.cv.enable = true;
+                    services.prometheus.enable = true;
+                  }
+                ];
+              };
+              rules = lib.head host.config.services.prometheus.ruleFiles;
+            in
+            pkgs.runCommand "alerts" { nativeBuildInputs = [ pkgs.prometheus.cli ]; } ''
+              ln -s ${rules} cv-alerts.json
+              cp ${./nix/alerts.test.yml} alerts.test.yml
+              promtool check rules cv-alerts.json
+              promtool test rules alerts.test.yml
+              touch $out
+            '';
         }
       );
     };

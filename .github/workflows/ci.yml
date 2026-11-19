@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # aarch64-linux: what `cv` is deployed on, and built on, by a host whose own CI only evaluates.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      # Builds `cv`, running its tests, for `module-in-sync`. Without a store cache: add one if
+      # this takes much more than 20 minutes.
+      - run: nix flake check -L

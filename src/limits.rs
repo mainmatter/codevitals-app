@@ -29,6 +29,10 @@ pub const WEBHOOK_BODY: usize = 25 << 20;
 pub const WEBHOOKS_AT_ONCE: usize = 8;
 /// GitHub's own: it gives up on a delivery after 10 seconds.
 pub const WEBHOOK_TIME: Duration = Duration::from_secs(10);
+/// Sign-ins asking GitHub at once.
+pub const SIGN_INS_AT_ONCE: usize = 8;
+/// Of a whole sign-in, waiting for a turn included: a person is watching a browser.
+pub const SIGN_IN_TIME: Duration = Duration::from_secs(30);
 pub const GITHUB_REQUEST: Duration = Duration::from_secs(30);
 /// Of one request, after a server or transport error, or a `429`.
 pub const GITHUB_RETRIES: usize = 3;
