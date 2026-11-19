@@ -1,6 +1,6 @@
 //! Signing people in with GitHub after they install the app.
 
-use std::{fmt::Display, sync::Arc};
+use std::{error::Error, sync::Arc};
 
 use axum::{
     extract::{Query, State},
@@ -16,7 +16,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-use crate::{App, limits, list};
+use crate::{App, describe, limits, list};
 
 /// `__Host-`: set by this origin only, over HTTPS only.
 const VERIFIER_COOKIE: &str = "__Host-pkce";
@@ -107,8 +107,8 @@ pub async fn callback(
     ))
 }
 
-fn failed(error: impl Display) -> StatusCode {
-    warn!(%error, "sign-in failed");
+fn failed(error: impl Into<Box<dyn Error + Send + Sync>>) -> StatusCode {
+    warn!(error = %describe(&*error.into()), "sign-in failed");
     StatusCode::BAD_GATEWAY
 }
 

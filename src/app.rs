@@ -22,7 +22,7 @@ use sqlx::PgPool;
 use tracing::{Instrument, info, info_span};
 
 use crate::{
-    App, Result, accounts, commits, facts, mainline,
+    App, Result, accounts, commits, describe, facts, mainline,
     mirror::{self, Mirror, Refs},
     pull_heads, pulls, telemetry,
 };
@@ -81,7 +81,7 @@ async fn step<T>(name: &'static str, work: impl Future<Output = Result<T>>) -> R
             let status = source.status_code.as_str();
             telemetry::GITHUB_ERRORS.with_label_values(&[status]).inc();
         }
-        format!("{name}: {error}").into()
+        format!("{name}: {}", describe(&*error)).into()
     })
 }
 
